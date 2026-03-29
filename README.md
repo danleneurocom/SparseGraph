@@ -68,6 +68,97 @@ python train.py --config configs/toposparsenet_base.json --epochs 1 --train-samp
 
 Outputs will be written to `runs/toposparsenet_base/` by default.
 
+## Temporary dataset: `ds005096`
+
+You can use [OpenNeuro `ds005096`](https://github.com/OpenNeuroDatasets/ds005096) as a temporary development dataset, but it should be treated as a topology and pipeline pretraining source, not as a substitute for real Ca2+ neuronal data.
+
+What it is:
+
+- TOF-MRA intracranial aneurysm data
+- BIDS-like subject/session layout
+- original angiography volumes
+- derivative aneurysm and parent-artery segmentations
+
+What it is good for:
+
+- NIfTI I/O and preprocessing
+- dense-to-sparse post-processing
+- skeleton, junction, and endpoint target generation
+- topology-aware training and graph-building experiments
+
+What it is not good for:
+
+- calcium-imaging temporal modeling
+- neuron-specific morphology and branching statistics
+- final model selection for your target problem
+
+Important download note:
+
+- cloning the GitHub repo gives you metadata and annexed placeholders
+- the actual `.nii/.nii.gz` image payloads must be fetched separately from OpenNeuro or DataLad-compatible storage
+
+Once the real volumes are present locally, convert them into the repo's `.npz` format with:
+
+```bash
+python scripts/prepare_ds005096.py \
+  --dataset-root /path/to/ds005096 \
+  --output-root data/ds005096_npz \
+  --image-size 256
+```
+
+This creates:
+
+- `data/ds005096_npz/train/*.npz`
+- `data/ds005096_npz/val/*.npz`
+
+Then update the config:
+
+```json
+{
+  "data": {
+    "dataset_type": "npz",
+    "train_dir": "data/ds005096_npz/train",
+    "val_dir": "data/ds005096_npz/val"
+  }
+}
+```
+
+## Temporary dataset: `IXI`
+
+The local IXI MRA collection is a better temporary fit operationally than the OpenNeuro clone because it contains real `.nii.gz` volumes directly. The tradeoff is that IXI MRA is unlabeled, so it can only support weak supervision or pseudo-label development unless you add manual annotations.
+
+Use IXI for:
+
+- preprocessing and NIfTI pipeline development
+- 3D-to-2D projection experiments
+- pseudo-label experiments using vesselness filtering and skeletonization
+- early graph-building and topology debugging
+
+Do not use IXI pseudo-label performance as your final scientific result. It is a bootstrap dataset, not the target task.
+
+Prepare IXI `.npz` samples with:
+
+```bash
+python scripts/prepare_ixi.py \
+  --dataset-root /path/to/IXI-MRA \
+  --output-root data/ixi_npz \
+  --image-size 256
+```
+
+The script builds:
+
+- 4-channel 2D summary images from each 3D MRA volume
+- pseudo vessel masks from Frangi vesselness + thresholding
+- pseudo skeleton, junction, endpoint, and affinity targets
+
+There is also a starter config at `configs/toposparsenet_ixi_pseudo.json`.
+
+If you are training on Apple Silicon, use the dedicated MPS config:
+
+```bash
+python train.py --config configs/toposparsenet_ixi_mps.json
+```
+
 ## Real-data format
 
 The `CalciumSummaryNpzDataset` expects one `.npz` file per sample with at least:

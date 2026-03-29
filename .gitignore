@@ -8,5 +8,6 @@ __pycache__/
 .ruff_cache/
 runs/
 checkpoints/
+data/
 dist/
 build/
