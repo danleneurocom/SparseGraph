@@ -54,6 +54,25 @@ def soft_skeletonize(img: torch.Tensor, iterations: int = 10) -> torch.Tensor:
     return skeleton.clamp(0.0, 1.0)
 
 
+def soft_neighbor_degree(img: torch.Tensor) -> torch.Tensor:
+    kernel = img.new_ones((1, 1, 3, 3))
+    kernel[:, :, 1, 1] = 0.0
+    return F.conv2d(img, kernel, padding=1)
+
+
+def soft_branchpoint_map(img: torch.Tensor, slope: float = 4.0) -> torch.Tensor:
+    degree = soft_neighbor_degree(img)
+    branch_gate = torch.sigmoid((degree - 2.25) * slope)
+    return (img * branch_gate).clamp(0.0, 1.0)
+
+
+def soft_endpoint_map(img: torch.Tensor, slope: float = 4.0) -> torch.Tensor:
+    degree = soft_neighbor_degree(img)
+    low_gate = torch.sigmoid((degree - 0.25) * slope)
+    high_gate = torch.sigmoid((1.75 - degree) * slope)
+    return (img * low_gate * high_gate).clamp(0.0, 1.0)
+
+
 def cldice_loss(
     pred_probs: torch.Tensor,
     target_probs: torch.Tensor,
@@ -116,10 +135,10 @@ def _masked_path_mean(feature_map: torch.Tensor, path_points: torch.Tensor, path
     return weighted.sum(dim=-2) / denominator
 
 
-def compute_graph_relation_logits(
+def compute_graph_relation_outputs(
     predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor] | None:
+) -> dict[str, torch.Tensor] | None:
     required_prediction_keys = {"graph_query_embeddings", "graph_key_embeddings", "path_memory_logits"}
     required_batch_keys = {
         "graph_pair_points",
@@ -161,6 +180,21 @@ def compute_graph_relation_logits(
         if "counterfactual_gate_logits" in predictions
         else torch.zeros_like(skeleton_prob)
     )
+    node_capacity_prob = (
+        torch.sigmoid(predictions["node_capacity_logits"])
+        if "node_capacity_logits" in predictions
+        else torch.zeros_like(skeleton_prob)
+    )
+    causal_saliency_prob = (
+        torch.sigmoid(predictions["causal_saliency_logits"])
+        if "causal_saliency_logits" in predictions
+        else torch.sigmoid(path_memory_logits)
+    )
+    dense_sparse_projection_prob = (
+        torch.sigmoid(predictions["dense_sparse_projection_logits"])
+        if "dense_sparse_projection_logits" in predictions
+        else skeleton_prob
+    )
 
     src_points = pair_points[:, :, 0]
     dst_points = pair_points[:, :, 1]
@@ -172,11 +206,21 @@ def compute_graph_relation_logits(
         _gather_point_features(node_prob, src_points).squeeze(-1)
         + _gather_point_features(node_prob, dst_points).squeeze(-1)
     )
+    node_capacity = 0.5 * (
+        _gather_point_features(node_capacity_prob, src_points).squeeze(-1)
+        + _gather_point_features(node_capacity_prob, dst_points).squeeze(-1)
+    )
     path_memory = _masked_path_mean(path_memory_logits, pair_path_points, pair_path_mask).squeeze(-1)
     path_skeleton = _masked_path_mean(skeleton_prob, pair_path_points, pair_path_mask).squeeze(-1)
     path_relay = _masked_path_mean(relay_prob, pair_path_points, pair_path_mask).squeeze(-1)
     path_bridge = _masked_path_mean(bridge_prob, pair_path_points, pair_path_mask).squeeze(-1)
     path_uncertainty = _masked_path_mean(uncertainty_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    path_causal = _masked_path_mean(causal_saliency_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    path_projection = _masked_path_mean(
+        dense_sparse_projection_prob,
+        pair_path_points,
+        pair_path_mask,
+    ).squeeze(-1)
     counterfactual_support = _masked_path_mean(
         counterfactual_prob,
         pair_path_points,
@@ -202,10 +246,29 @@ def compute_graph_relation_logits(
         + 0.20 * path_bridge
         + 0.25 * counterfactual_support
         + 0.20 * node_support
+        + 0.35 * node_capacity
+        + 0.70 * path_causal
+        + 0.50 * path_projection
         - 0.45 * path_uncertainty
         - 0.35 * distance
     )
-    return graph_logits, valid_mask
+    importance_pred = torch.clamp(
+        0.42 * path_causal
+        + 0.18 * node_capacity
+        + 0.15 * counterfactual_support
+        + 0.10 * path_memory
+        + 0.15 * path_projection,
+        min=0.0,
+        max=1.0,
+    )
+    return {
+            "graph_logits": graph_logits,
+            "valid_mask": valid_mask,
+            "importance_pred": importance_pred,
+            "node_capacity": node_capacity,
+            "path_causal": path_causal,
+            "path_projection": path_projection,
+        }
 
 
 class TopoSparseObjective(nn.Module):
@@ -256,10 +319,99 @@ class TopoSparseObjective(nn.Module):
             torch.sigmoid(predictions["endpoint_logits"]),
         )
         consistency_loss = consistency_loss + (node_probs * (1.0 - skeleton_probs)).mean()
+        target_degree = soft_neighbor_degree(batch["skeleton"])
+        pred_degree = soft_neighbor_degree(skeleton_probs)
+        branchpoint_probs = soft_branchpoint_map(skeleton_probs)
+        endpoint_from_skeleton = soft_endpoint_map(skeleton_probs)
+        node_focus = F.max_pool2d(
+            torch.maximum(batch["junction"], batch["endpoint"]),
+            kernel_size=5,
+            stride=1,
+            padding=2,
+        )
         support_loss = predictions["mask_logits"].new_tensor(0.0)
         bio_prior_loss = predictions["mask_logits"].new_tensor(0.0)
         causal_loss = predictions["mask_logits"].new_tensor(0.0)
         relay_loss = predictions["mask_logits"].new_tensor(0.0)
+        node_policy_loss = predictions["mask_logits"].new_tensor(0.0)
+        graph_importance_loss = predictions["mask_logits"].new_tensor(0.0)
+        branch_budget_loss = predictions["mask_logits"].new_tensor(0.0)
+        branch_austerity_loss = predictions["mask_logits"].new_tensor(0.0)
+
+        branch_budget_loss = branch_budget_loss + dice_loss_from_probs(
+            branchpoint_probs,
+            batch["junction"],
+        )
+        branch_budget_loss = branch_budget_loss + 0.5 * dice_loss_from_probs(
+            endpoint_from_skeleton,
+            batch["endpoint"],
+        )
+        branch_budget_loss = branch_budget_loss + 0.35 * masked_smooth_l1(
+            pred_degree,
+            target_degree,
+            node_focus,
+        )
+        pred_branch_count = branchpoint_probs.flatten(1).sum(dim=1)
+        target_branch_count = batch["junction"].flatten(1).sum(dim=1)
+        pred_endpoint_count = endpoint_from_skeleton.flatten(1).sum(dim=1)
+        target_endpoint_count = batch["endpoint"].flatten(1).sum(dim=1)
+        branch_count_scale = target_branch_count.detach().clamp_min(1.0)
+        endpoint_count_scale = target_endpoint_count.detach().clamp_min(1.0)
+        branch_budget_loss = branch_budget_loss + 0.20 * F.smooth_l1_loss(
+            pred_branch_count / branch_count_scale,
+            target_branch_count / branch_count_scale,
+        )
+        branch_budget_loss = branch_budget_loss + 0.10 * F.smooth_l1_loss(
+            pred_endpoint_count / endpoint_count_scale,
+            target_endpoint_count / endpoint_count_scale,
+        )
+        if "branch_keep_logits" in predictions and "branch_prune_logits" in predictions:
+            graph_causal_target = batch.get("graph_causal_path", batch["skeleton"])
+            node_context = F.max_pool2d(
+                torch.maximum(batch["junction"], batch["endpoint"]),
+                kernel_size=7,
+                stride=1,
+                padding=3,
+            )
+            keep_target = torch.clamp(
+                0.65 * graph_causal_target + 0.35 * node_context,
+                0.0,
+                1.0,
+            )
+            prune_target = torch.clamp(
+                F.max_pool2d(batch["mask"], kernel_size=5, stride=1, padding=2)
+                * (1.0 - F.max_pool2d(graph_causal_target, kernel_size=5, stride=1, padding=2))
+                * (1.0 - F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2)),
+                0.0,
+                1.0,
+            )
+            branch_keep_probs = torch.sigmoid(predictions["branch_keep_logits"])
+            branch_prune_probs = torch.sigmoid(predictions["branch_prune_logits"])
+            branch_austerity_loss = branch_austerity_loss + dice_loss_from_probs(
+                branch_keep_probs,
+                keep_target,
+            )
+            branch_austerity_loss = branch_austerity_loss + 0.5 * binary_focal_loss_with_logits(
+                predictions["branch_keep_logits"],
+                keep_target,
+            )
+            branch_austerity_loss = branch_austerity_loss + dice_loss_from_probs(
+                branch_prune_probs,
+                prune_target,
+            )
+            branch_austerity_loss = branch_austerity_loss + 0.5 * binary_focal_loss_with_logits(
+                predictions["branch_prune_logits"],
+                prune_target,
+            )
+            allowed_branch_zone = F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2)
+            branch_austerity_loss = branch_austerity_loss + 0.40 * (
+                soft_branchpoint_map(skeleton_probs) * (1.0 - allowed_branch_zone) * (1.0 - keep_target)
+            ).mean()
+            branch_austerity_loss = branch_austerity_loss + 0.20 * (
+                skeleton_probs
+                * branch_prune_probs
+                * (1.0 - F.max_pool2d(batch["skeleton"], kernel_size=3, stride=1, padding=1))
+            ).mean()
 
         auxiliary_loss = predictions["mask_logits"].new_tensor(0.0)
         if "coarse_mask_logits" in predictions:
@@ -335,6 +487,54 @@ class TopoSparseObjective(nn.Module):
                 junction_relay_probs,
                 junction_relay_target,
             )
+        if "node_capacity_logits" in predictions and "graph_node_capacity" in batch:
+            node_mask = torch.maximum(batch["junction"], batch["endpoint"])
+            node_policy_loss = node_policy_loss + masked_smooth_l1(
+                torch.sigmoid(predictions["node_capacity_logits"]),
+                batch["graph_node_capacity"],
+                node_mask,
+            )
+        if "causal_saliency_logits" in predictions and "graph_causal_path" in batch:
+            causal_saliency_probs = torch.sigmoid(predictions["causal_saliency_logits"])
+            node_policy_loss = node_policy_loss + dice_loss_from_probs(
+                causal_saliency_probs,
+                batch["graph_causal_path"],
+            )
+            node_policy_loss = node_policy_loss + 0.5 * F.smooth_l1_loss(
+                causal_saliency_probs,
+                batch["graph_causal_path"],
+            )
+        if "dense_sparse_projection_logits" in predictions:
+            dense_sparse_projection_probs = torch.sigmoid(predictions["dense_sparse_projection_logits"])
+            projection_target = torch.clamp(
+                0.75 * batch["skeleton"] + 0.25 * batch.get("graph_causal_path", batch["skeleton"]),
+                0.0,
+                1.0,
+            )
+            dense_mask_projection = soft_skeletonize(
+                mask_probs,
+                iterations=max(int(self.weights.get("skeleton_iterations", 10)) // 2, 4),
+            )
+            branch_austerity_loss = branch_austerity_loss + 0.75 * dice_loss_from_probs(
+                dense_sparse_projection_probs,
+                projection_target,
+            )
+            branch_austerity_loss = branch_austerity_loss + 0.25 * binary_focal_loss_with_logits(
+                predictions["dense_sparse_projection_logits"],
+                projection_target,
+            )
+            consistency_loss = consistency_loss + 0.35 * dice_loss_from_probs(
+                dense_sparse_projection_probs,
+                dense_mask_projection,
+            )
+            consistency_loss = consistency_loss + 0.20 * dice_loss_from_probs(
+                skeleton_probs,
+                dense_sparse_projection_probs.detach(),
+            )
+            consistency_loss = consistency_loss + 0.15 * (
+                dense_sparse_projection_probs
+                * (1.0 - F.max_pool2d(mask_probs, kernel_size=3, stride=1, padding=1))
+            ).mean()
 
         if (
             "morphology_prior_logits" in predictions
@@ -368,9 +568,10 @@ class TopoSparseObjective(nn.Module):
             causal_loss = causal_loss + (skeleton_probs * activity_only).mean()
             causal_loss = causal_loss + 0.5 * (mask_probs * conflict_probs).mean()
 
-        graph_metrics = compute_graph_relation_logits(predictions, batch)
-        if graph_metrics is not None and "graph_target" in batch:
-            graph_logits, graph_valid = graph_metrics
+        graph_outputs = compute_graph_relation_outputs(predictions, batch)
+        if graph_outputs is not None and "graph_target" in batch:
+            graph_logits = graph_outputs["graph_logits"]
+            graph_valid = graph_outputs["valid_mask"]
             graph_target = batch["graph_target"].float()
             graph_weight = graph_valid.float()
             graph_loss_map = F.binary_cross_entropy_with_logits(
@@ -386,10 +587,25 @@ class TopoSparseObjective(nn.Module):
             graph_accuracy = graph_correct / graph_weight.sum().clamp_min(1.0)
             positive_weight = (graph_target * graph_weight).sum().clamp_min(1.0)
             graph_recall = ((graph_pred * graph_target) * graph_weight).sum() / positive_weight
+            if "graph_pair_importance" in batch:
+                importance_target = batch["graph_pair_importance"].float()
+                importance_pred = graph_outputs["importance_pred"]
+                graph_importance_loss = F.smooth_l1_loss(
+                    importance_pred * graph_weight,
+                    importance_target * graph_weight,
+                    reduction="sum",
+                ) / graph_weight.sum().clamp_min(1.0)
+                pair_importance_mae = (
+                    (importance_pred - importance_target).abs() * graph_weight
+                ).sum() / graph_weight.sum().clamp_min(1.0)
+            else:
+                pair_importance_mae = predictions["mask_logits"].new_tensor(0.0)
+            predictions["graph_logits"] = graph_logits.detach()
         else:
             graph_loss = predictions["mask_logits"].new_tensor(0.0)
             graph_accuracy = predictions["mask_logits"].new_tensor(0.0)
             graph_recall = predictions["mask_logits"].new_tensor(0.0)
+            pair_importance_mae = predictions["mask_logits"].new_tensor(0.0)
 
         total = (
             self.weights.get("mask", 1.0) * mask_loss
@@ -405,6 +621,10 @@ class TopoSparseObjective(nn.Module):
             + self.weights.get("bio_prior", 0.0) * bio_prior_loss
             + self.weights.get("causal", 0.0) * causal_loss
             + self.weights.get("relay", 0.0) * relay_loss
+            + self.weights.get("node_policy", 0.0) * node_policy_loss
+            + self.weights.get("branch_budget", 0.0) * branch_budget_loss
+            + self.weights.get("branch_austerity", 0.0) * branch_austerity_loss
+            + self.weights.get("graph_importance", 0.0) * graph_importance_loss
             + self.weights.get("graph", 0.0) * graph_loss
         )
 
@@ -423,9 +643,14 @@ class TopoSparseObjective(nn.Module):
             "bio_prior_loss": bio_prior_loss,
             "causal_loss": causal_loss,
             "relay_loss": relay_loss,
+            "node_policy_loss": node_policy_loss,
+            "branch_budget_loss": branch_budget_loss,
+            "branch_austerity_loss": branch_austerity_loss,
             "graph_loss": graph_loss,
+            "graph_importance_loss": graph_importance_loss,
             "graph_accuracy": graph_accuracy,
             "graph_recall": graph_recall,
+            "pair_importance_mae": pair_importance_mae,
             "mask_dice": binary_dice_score_from_logits(predictions["mask_logits"], batch["mask"]),
             "skeleton_dice": binary_dice_score_from_logits(
                 predictions["skeleton_logits"], batch["skeleton"]

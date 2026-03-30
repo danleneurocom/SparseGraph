@@ -4,6 +4,8 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ..losses import soft_skeletonize
+
 
 def make_norm(num_channels: int, max_groups: int = 8) -> nn.GroupNorm:
     groups = min(max_groups, num_channels)
@@ -604,6 +606,366 @@ class CounterfactualGeodesicReasoning(nn.Module):
             "counterfactual_gate_logits": self.counterfactual_gate_head(
                 graph_features + counterfactual_features
             ),
+        }
+        return dense_out, sparse_out, outputs
+
+
+class NodeAwareCausalPolicy(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.policy_encoder = nn.Sequential(
+            nn.Conv2d(9, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.node_capacity_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.causal_saliency_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.node_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.causal_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.node_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.causal_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.dense_update = ResidualBlock(channels * 2, channels)
+        self.sparse_update = ResidualBlock(channels * 2, channels)
+
+    def forward(
+        self,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+        topology_logits: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        topology_probs = [torch.sigmoid(logits) for logits in topology_logits]
+        (
+            mask_prob,
+            skeleton_prob,
+            junction_prob,
+            endpoint_prob,
+            relay_prob,
+            bridge_prob,
+            counterfactual_prob,
+            path_memory_prob,
+        ) = topology_probs
+        node_support = torch.maximum(junction_prob, endpoint_prob)
+        counterfactual_gap = torch.clamp(counterfactual_prob - skeleton_prob, min=0.0, max=1.0)
+        policy_state = self.policy_encoder(
+            torch.cat(
+                [
+                    mask_prob,
+                    skeleton_prob,
+                    junction_prob,
+                    endpoint_prob,
+                    relay_prob,
+                    bridge_prob,
+                    counterfactual_prob,
+                    path_memory_prob,
+                    counterfactual_gap,
+                ],
+                dim=1,
+            )
+        )
+        node_capacity_logits = self.node_capacity_head(policy_state)
+        causal_saliency_logits = self.causal_saliency_head(policy_state)
+        node_capacity = torch.sigmoid(node_capacity_logits)
+        causal_saliency = torch.sigmoid(causal_saliency_logits)
+        node_prior = torch.clamp(0.65 * node_support + 0.35 * node_capacity, 0.0, 1.0)
+        causal_prior = torch.clamp(
+            0.40 * skeleton_prob
+            + 0.25 * relay_prob
+            + 0.20 * path_memory_prob
+            + 0.15 * bridge_prob
+            + 0.35 * causal_saliency
+            - 0.10 * counterfactual_gap,
+            0.0,
+            1.0,
+        )
+        node_features = self.node_to_features(node_prior)
+        causal_features = self.causal_to_features(causal_prior)
+        node_gate = self.node_gate(
+            torch.cat([dense_features, sparse_features, policy_state, node_features], dim=1)
+        )
+        causal_gate = self.causal_gate(
+            torch.cat([sparse_features, dense_features, policy_state, causal_features], dim=1)
+        )
+        dense_out = self.dense_update(
+            torch.cat([dense_features * (1.0 + node_gate), policy_state + node_features], dim=1)
+        )
+        sparse_out = self.sparse_update(
+            torch.cat(
+                [
+                    sparse_features * (1.0 + causal_gate) * (1.0 + causal_prior),
+                    policy_state + causal_features + 0.5 * node_features,
+                ],
+                dim=1,
+            )
+        )
+        outputs = {
+            "node_capacity_logits": node_capacity_logits,
+            "causal_saliency_logits": causal_saliency_logits,
+        }
+        return dense_out, sparse_out, outputs
+
+
+class CausalBranchAusterity(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.register_buffer(
+            "neighbor_kernel",
+            torch.tensor(
+                [[[[1.0, 1.0, 1.0], [1.0, 0.0, 1.0], [1.0, 1.0, 1.0]]]],
+                dtype=torch.float32,
+            ),
+            persistent=False,
+        )
+        self.policy_encoder = nn.Sequential(
+            nn.Conv2d(8, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.node_capacity_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.causal_saliency_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.branch_keep_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.branch_prune_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.dense_sparse_projection_head = nn.Sequential(
+            nn.Conv2d(channels * 2, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.keep_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.node_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.causal_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.prune_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.projection_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.keep_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.prune_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_update = ResidualBlock(channels * 2, channels)
+        self.sparse_update = ResidualBlock(channels * 2, channels)
+
+    def _soft_branch_proxy(self, skeleton_prob: torch.Tensor) -> torch.Tensor:
+        degree = F.conv2d(
+            skeleton_prob,
+            self.neighbor_kernel.to(device=skeleton_prob.device, dtype=skeleton_prob.dtype),
+            padding=1,
+        )
+        branch_gate = torch.sigmoid((degree - 2.25) * 4.0)
+        return torch.clamp(skeleton_prob * branch_gate, 0.0, 1.0)
+
+    def forward(
+        self,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+        topology_logits: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        topology_probs = [torch.sigmoid(logits) for logits in topology_logits]
+        (
+            mask_prob,
+            skeleton_prob,
+            junction_prob,
+            endpoint_prob,
+            relay_prob,
+            bridge_prob,
+            counterfactual_prob,
+            path_memory_prob,
+        ) = topology_probs
+        node_support = torch.maximum(junction_prob, endpoint_prob)
+        junction_context = F.max_pool2d(junction_prob, kernel_size=5, stride=1, padding=2)
+        endpoint_context = F.max_pool2d(endpoint_prob, kernel_size=5, stride=1, padding=2)
+        counterfactual_gap = torch.clamp(counterfactual_prob - skeleton_prob, min=0.0, max=1.0)
+        branch_proxy = self._soft_branch_proxy(skeleton_prob)
+        policy_state = self.policy_encoder(
+            torch.cat(
+                [
+                    mask_prob,
+                    skeleton_prob,
+                    junction_prob,
+                    endpoint_prob,
+                    relay_prob,
+                    bridge_prob,
+                    counterfactual_prob,
+                    path_memory_prob,
+                ],
+                dim=1,
+            )
+        )
+        dense_sparse_projection_logits = self.dense_sparse_projection_head(
+            torch.cat([policy_state, dense_features], dim=1)
+        )
+        dense_mask_prior = soft_skeletonize(mask_prob, iterations=6)
+        dense_sparse_projection_prob = torch.clamp(
+            0.60 * torch.sigmoid(dense_sparse_projection_logits) + 0.40 * dense_mask_prior,
+            0.0,
+            1.0,
+        )
+        node_capacity_logits = self.node_capacity_head(policy_state)
+        causal_saliency_logits = self.causal_saliency_head(policy_state)
+        node_capacity_prob = torch.sigmoid(node_capacity_logits)
+        causal_saliency_prob = torch.sigmoid(causal_saliency_logits)
+        essential_prior = torch.clamp(
+            0.30 * skeleton_prob
+            + 0.20 * relay_prob
+            + 0.15 * path_memory_prob
+            + 0.20 * dense_sparse_projection_prob
+            + 0.25 * causal_saliency_prob
+            + 0.15 * endpoint_context
+            + 0.10 * junction_context
+            + 0.10 * node_capacity_prob,
+            0.0,
+            1.0,
+        )
+        surplus_risk = torch.clamp(
+            0.55 * branch_proxy * (1.0 - junction_context)
+            + 0.20 * bridge_prob * (1.0 - path_memory_prob)
+            + 0.15 * counterfactual_gap
+            + 0.10 * relay_prob * (1.0 - node_capacity_prob),
+            0.0,
+            1.0,
+        )
+        branch_keep_logits = self.branch_keep_head(policy_state)
+        branch_prune_logits = self.branch_prune_head(policy_state)
+        branch_keep = torch.clamp(0.55 * torch.sigmoid(branch_keep_logits) + 0.45 * essential_prior, 0.0, 1.0)
+        branch_prune = torch.clamp(
+            torch.sigmoid(branch_prune_logits) * surplus_risk * (1.0 - 0.55 * dense_sparse_projection_prob),
+            0.0,
+            1.0,
+        )
+        keep_features = self.keep_to_features(branch_keep)
+        node_features = self.node_to_features(node_capacity_prob)
+        causal_features = self.causal_to_features(causal_saliency_prob)
+        prune_features = self.prune_to_features(branch_prune)
+        projection_features = self.projection_to_features(dense_sparse_projection_prob)
+        keep_gate = self.keep_gate(
+            torch.cat([dense_features, sparse_features, policy_state, keep_features + node_features], dim=1)
+        )
+        prune_gate = self.prune_gate(
+            torch.cat([sparse_features, dense_features, policy_state, prune_features + causal_features], dim=1)
+        )
+        dense_out = self.dense_update(
+            torch.cat(
+                [
+                    dense_features
+                    * (1.0 + keep_gate * (0.5 * branch_keep + 0.3 * node_capacity_prob + 0.2 * dense_sparse_projection_prob)),
+                    policy_state + keep_features + 0.5 * node_features + 0.35 * projection_features - 0.25 * prune_features,
+                ],
+                dim=1,
+            )
+        )
+        sparse_out = self.sparse_update(
+            torch.cat(
+                [
+                    sparse_features
+                    * (1.0 + keep_gate * branch_keep)
+                    * (1.0 + 0.35 * causal_saliency_prob)
+                    * (1.0 + 0.30 * dense_sparse_projection_prob)
+                    * (1.0 - 0.65 * prune_gate * branch_prune)
+                    * (1.0 + 0.20 * node_support),
+                    policy_state
+                    + keep_features
+                    + causal_features
+                    + 0.35 * node_features
+                    + 0.50 * projection_features
+                    - prune_features,
+                ],
+                dim=1,
+            )
+        )
+        outputs = {
+            "node_capacity_logits": node_capacity_logits,
+            "causal_saliency_logits": causal_saliency_logits,
+            "branch_keep_logits": branch_keep_logits,
+            "branch_prune_logits": branch_prune_logits,
+            "dense_sparse_projection_logits": dense_sparse_projection_logits,
         }
         return dense_out, sparse_out, outputs
 

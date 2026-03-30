@@ -178,6 +178,47 @@ def _trace_graph_edges(
     return traced_edges
 
 
+def _edge_component_sizes(
+    adjacency: dict[int, set[int]],
+    source: int,
+    target: int,
+) -> tuple[int, int]:
+    def bfs(start: int, blocked: tuple[int, int]) -> set[int]:
+        queue = [start]
+        visited = {start}
+        while queue:
+            current = queue.pop()
+            for neighbor in adjacency.get(current, set()):
+                if (current == blocked[0] and neighbor == blocked[1]) or (
+                    current == blocked[1] and neighbor == blocked[0]
+                ):
+                    continue
+                if neighbor in visited:
+                    continue
+                visited.add(neighbor)
+                queue.append(neighbor)
+        return visited
+
+    source_component = bfs(source, (source, target))
+    target_component = bfs(target, (source, target))
+    return len(source_component), len(target_component)
+
+
+def _causal_edge_importance(
+    adjacency: dict[int, set[int]],
+    source: int,
+    target: int,
+    path_length: int,
+    diagonal_length: float,
+) -> float:
+    component_a, component_b = _edge_component_sizes(adjacency, source, target)
+    total_component = max(component_a + component_b, 1)
+    split_importance = min(component_a, component_b) / max(total_component - 1, 1)
+    length_importance = min(float(path_length) / max(diagonal_length, 1.0), 1.0)
+    causal_importance = 0.65 * split_importance + 0.35 * length_importance
+    return float(np.clip(causal_importance, 0.0, 1.0))
+
+
 def _build_graph_training_targets(
     skeleton: np.ndarray,
     junction: np.ndarray,
@@ -189,10 +230,13 @@ def _build_graph_training_targets(
     nodes = _graph_nodes_from_targets(skeleton, junction, endpoint)
     positive_edges = _trace_graph_edges(skeleton, nodes)
 
+    graph_node_capacity = np.zeros_like(skeleton, dtype=np.float32)
+    graph_causal_path = np.zeros_like(skeleton, dtype=np.float32)
     pair_points = np.zeros((max_pairs, 2, 2), dtype=np.int64)
     pair_path_points = np.zeros((max_pairs, path_length, 2), dtype=np.int64)
     pair_path_mask = np.zeros((max_pairs, path_length), dtype=np.float32)
     pair_target = np.zeros((max_pairs,), dtype=np.float32)
+    pair_importance = np.zeros((max_pairs,), dtype=np.float32)
     pair_valid = np.zeros((max_pairs,), dtype=np.float32)
 
     positive_lookup = {
@@ -205,8 +249,35 @@ def _build_graph_training_targets(
             "graph_pair_path_points": pair_path_points,
             "graph_pair_path_mask": pair_path_mask,
             "graph_target": pair_target,
+            "graph_pair_importance": pair_importance,
             "graph_pair_valid": pair_valid,
+            "graph_node_capacity": graph_node_capacity[None, ...],
+            "graph_causal_path": graph_causal_path[None, ...],
         }
+
+    adjacency: dict[int, set[int]] = {int(node["index"]): set() for node in nodes}
+    positive_importance: dict[tuple[int, int], float] = {}
+    diagonal_length = float(np.hypot(*skeleton.shape))
+    for source, target, path in positive_edges:
+        adjacency[source].add(target)
+        adjacency[target].add(source)
+    for source, target, path in positive_edges:
+        pair = tuple(sorted((source, target)))
+        importance = _causal_edge_importance(
+            adjacency=adjacency,
+            source=source,
+            target=target,
+            path_length=len(path),
+            diagonal_length=diagonal_length,
+        )
+        positive_importance[pair] = importance
+        for y, x in path:
+            graph_causal_path[y, x] = max(graph_causal_path[y, x], importance)
+    for node in nodes:
+        node_degree = len(adjacency.get(int(node["index"]), set()))
+        capacity = float(np.clip((node_degree - 1) / 3.0, 0.0, 1.0))
+        for y, x in node["pixels"]:
+            graph_node_capacity[y, x] = capacity
 
     positive_pairs: list[tuple[tuple[int, int], list[tuple[int, int]]]] = list(positive_lookup.items())
     negative_pairs: list[tuple[int, int, float]] = []
@@ -229,21 +300,24 @@ def _build_graph_training_targets(
     else:
         selected_positive = positive_pairs
 
-    pair_records: list[tuple[int, int, float, list[tuple[int, int]]]] = []
+    pair_records: list[tuple[int, int, float, float, list[tuple[int, int]]]] = []
     for (source, target), path in selected_positive:
-        pair_records.append((source, target, 1.0, path))
+        pair_records.append((source, target, 1.0, float(positive_importance.get((source, target), 1.0)), path))
 
     remaining = max_pairs - len(pair_records)
     for source, target, _ in negative_pairs[: max(remaining, 0)]:
-        pair_records.append((source, target, 0.0, _line_points(nodes[source]["point"], nodes[target]["point"])))
+        pair_records.append(
+            (source, target, 0.0, 0.0, _line_points(nodes[source]["point"], nodes[target]["point"]))
+        )
 
-    for pair_index, (source, target, label, path) in enumerate(pair_records[:max_pairs]):
+    for pair_index, (source, target, label, importance, path) in enumerate(pair_records[:max_pairs]):
         pair_points[pair_index, 0] = np.asarray(nodes[source]["point"], dtype=np.int64)
         pair_points[pair_index, 1] = np.asarray(nodes[target]["point"], dtype=np.int64)
         sampled_path, sampled_mask = _sample_path_points(path, path_length)
         pair_path_points[pair_index] = sampled_path
         pair_path_mask[pair_index] = sampled_mask
         pair_target[pair_index] = float(label)
+        pair_importance[pair_index] = float(importance)
         pair_valid[pair_index] = 1.0
 
     return {
@@ -251,7 +325,10 @@ def _build_graph_training_targets(
         "graph_pair_path_points": pair_path_points,
         "graph_pair_path_mask": pair_path_mask,
         "graph_target": pair_target,
+        "graph_pair_importance": pair_importance,
         "graph_pair_valid": pair_valid,
+        "graph_node_capacity": graph_node_capacity[None, ...],
+        "graph_causal_path": graph_causal_path[None, ...],
     }
 
 

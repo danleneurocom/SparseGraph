@@ -54,6 +54,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "bio_prior": 0.0,
         "causal": 0.0,
         "relay": 0.0,
+        "node_policy": 0.0,
+        "branch_budget": 0.0,
+        "branch_austerity": 0.0,
+        "graph_importance": 0.0,
         "graph": 0.0,
         "skeleton_iterations": 10,
     },
@@ -75,6 +79,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "relay_weight": 0.15,
         "mask_weight": 0.1,
         "relation_weight": 0.55,
+        "causal_weight": 0.25,
     },
 }
 

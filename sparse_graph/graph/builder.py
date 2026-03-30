@@ -51,6 +51,16 @@ class GraphBuilder:
         relay_weight: float = 0.15,
         mask_weight: float = 0.1,
         relation_weight: float = 0.55,
+        causal_weight: float = 0.25,
+        prune_mode: str = "none",
+        prune_terminal_score: float = 0.68,
+        prune_terminal_node_score: float = 0.80,
+        prune_min_spur_length: int = 32,
+        prune_keep_trunk_length: int = 96,
+        prune_keep_edge_score: float = 0.90,
+        prune_min_component_length: int = 80,
+        prune_component_score: float = 0.78,
+        enforce_tree: bool = False,
     ) -> None:
         self.node_threshold = node_threshold
         self.mask_threshold = mask_threshold
@@ -69,6 +79,16 @@ class GraphBuilder:
         self.relay_weight = relay_weight
         self.mask_weight = mask_weight
         self.relation_weight = relation_weight
+        self.causal_weight = causal_weight
+        self.prune_mode = prune_mode
+        self.prune_terminal_score = prune_terminal_score
+        self.prune_terminal_node_score = prune_terminal_node_score
+        self.prune_min_spur_length = prune_min_spur_length
+        self.prune_keep_trunk_length = prune_keep_trunk_length
+        self.prune_keep_edge_score = prune_keep_edge_score
+        self.prune_min_component_length = prune_min_component_length
+        self.prune_component_score = prune_component_score
+        self.enforce_tree = enforce_tree
 
     def __call__(self, predictions: dict[str, torch.Tensor]) -> dict[str, Any]:
         mask = torch.sigmoid(predictions["mask_logits"][0, 0])
@@ -99,21 +119,43 @@ class GraphBuilder:
             if "counterfactual_gate_logits" in predictions
             else None
         )
+        node_capacity = (
+            torch.sigmoid(predictions["node_capacity_logits"][0, 0])
+            if "node_capacity_logits" in predictions
+            else None
+        )
+        causal_saliency = (
+            torch.sigmoid(predictions["causal_saliency_logits"][0, 0])
+            if "causal_saliency_logits" in predictions
+            else None
+        )
+        dense_sparse_projection = (
+            torch.sigmoid(predictions["dense_sparse_projection_logits"][0, 0])
+            if "dense_sparse_projection_logits" in predictions
+            else None
+        )
 
-        nodes = self._extract_nodes(junction, endpoint, skeleton, relay, bridge)
+        nodes = self._extract_nodes(junction, endpoint, skeleton, relay, bridge, dense_sparse_projection)
         edges = self._propose_edges(
             nodes,
             mask,
             skeleton,
             relay,
             bridge,
+            dense_sparse_projection,
             uncertainty,
             affinity,
             graph_query,
             graph_key,
             path_memory,
             counterfactual_gate,
+            node_capacity,
+            causal_saliency,
         )
+
+        raw_nodes = list(nodes)
+        raw_edges = list(edges)
+        nodes, edges = self._prune_graph(nodes, edges)
 
         graph = nx.Graph()
         for node in nodes:
@@ -127,7 +169,13 @@ class GraphBuilder:
         for edge in edges:
             graph.add_edge(edge.source, edge.target, score=edge.score, path=edge.path)
 
-        return {"nodes": nodes, "edges": edges, "graph": graph}
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "graph": graph,
+            "raw_nodes": raw_nodes,
+            "raw_edges": raw_edges,
+        }
 
     def _extract_nodes(
         self,
@@ -136,8 +184,11 @@ class GraphBuilder:
         skeleton: torch.Tensor,
         relay: torch.Tensor,
         bridge: torch.Tensor,
+        dense_sparse_projection: torch.Tensor | None,
     ) -> list[GraphNode]:
         support = torch.maximum(skeleton, torch.maximum(relay, bridge))
+        if dense_sparse_projection is not None:
+            support = torch.maximum(support, dense_sparse_projection)
         candidates: list[tuple[str, float, int, int]] = []
         for kind, heatmap, threshold in (
             ("junction", junction, self.junction_threshold),
@@ -174,29 +225,46 @@ class GraphBuilder:
         skeleton: torch.Tensor,
         relay: torch.Tensor,
         bridge: torch.Tensor,
+        dense_sparse_projection: torch.Tensor | None,
         uncertainty: torch.Tensor,
         affinity: torch.Tensor,
         graph_query: torch.Tensor | None,
         graph_key: torch.Tensor | None,
         path_memory: torch.Tensor | None,
         counterfactual_gate: torch.Tensor | None,
+        node_capacity: torch.Tensor | None,
+        causal_saliency: torch.Tensor | None,
     ) -> list[GraphEdge]:
         edges: list[GraphEdge] = []
         used_pairs: set[tuple[int, int]] = set()
-        degree_budget = {
-            node.index: (1 if node.kind == "endpoint" else max(self.max_neighbors_per_node, 3))
-            for node in nodes
-        }
+        degree_budget = {}
+        for node in nodes:
+            if node.kind == "endpoint":
+                degree_budget[node.index] = 1
+                continue
+            if node_capacity is not None:
+                capacity_value = float(node_capacity[node.y, node.x].item())
+                predicted_budget = int(round(1.0 + 3.0 * capacity_value))
+                degree_budget[node.index] = max(2, min(max(self.max_neighbors_per_node, 4), predicted_budget))
+            else:
+                degree_budget[node.index] = max(self.max_neighbors_per_node, 3)
         current_degree = {node.index: 0 for node in nodes}
 
         structure_support = torch.clamp(
-            0.55 * skeleton
+            0.45 * skeleton
             + self.bridge_weight * bridge
             + self.relay_weight * relay
+            + 0.20 * (dense_sparse_projection if dense_sparse_projection is not None else skeleton)
             + self.mask_weight * mask,
             min=1e-4,
             max=1.0,
         )
+        if causal_saliency is not None:
+            structure_support = torch.clamp(
+                structure_support + self.causal_weight * causal_saliency,
+            min=1e-4,
+            max=1.0,
+            )
         cost_map = (-torch.log(structure_support) + self.uncertainty_weight * uncertainty).detach().cpu().numpy()
         support_np = structure_support.detach().cpu().numpy()
         uncertainty_np = uncertainty.detach().cpu().numpy()
@@ -207,6 +275,8 @@ class GraphBuilder:
         counterfactual_np = (
             counterfactual_gate.detach().cpu().numpy() if counterfactual_gate is not None else None
         )
+        node_capacity_np = node_capacity.detach().cpu().numpy() if node_capacity is not None else None
+        causal_saliency_np = causal_saliency.detach().cpu().numpy() if causal_saliency is not None else None
 
         for node in nodes:
             distances: list[tuple[float, GraphNode]] = []
@@ -253,6 +323,8 @@ class GraphBuilder:
                     graph_key_np,
                     path_memory_np,
                     counterfactual_np,
+                    node_capacity_np,
+                    causal_saliency_np,
                     support_np,
                     uncertainty_np,
                 )
@@ -348,6 +420,8 @@ class GraphBuilder:
         graph_key: np.ndarray | None,
         path_memory: np.ndarray | None,
         counterfactual_gate: np.ndarray | None,
+        node_capacity: np.ndarray | None,
+        causal_saliency: np.ndarray | None,
         support_map: np.ndarray,
         uncertainty_map: np.ndarray,
     ) -> float:
@@ -366,6 +440,12 @@ class GraphBuilder:
         path_memory_score = self._path_support(path, path_memory)
         path_support = self._path_support(path, support_map)
         uncertainty = self._path_support(path, uncertainty_map)
+        node_capacity_score = (
+            0.5 * (float(node_capacity[node.y, node.x]) + float(node_capacity[other.y, other.x]))
+            if node_capacity is not None
+            else 0.0
+        )
+        causal_score = self._path_support(path, causal_saliency) if causal_saliency is not None else 0.0
         counterfactual_score = (
             self._path_support(path, counterfactual_gate) if counterfactual_gate is not None else 0.0
         )
@@ -375,9 +455,139 @@ class GraphBuilder:
             1.35 * compatibility
             + 1.00 * path_memory_score
             + 0.90 * path_support
+            + 0.75 * causal_score
+            + 0.30 * node_capacity_score
             + 0.20 * counterfactual_score
             + 0.10 * 0.5 * (node.score + other.score)
             - 0.45 * uncertainty
             - 0.30 * distance
         )
         return float(1.0 / (1.0 + np.exp(-relation_logit)))
+
+    def _prune_graph(
+        self,
+        nodes: list[GraphNode],
+        edges: list[GraphEdge],
+    ) -> tuple[list[GraphNode], list[GraphEdge]]:
+        if self.prune_mode == "none" or not edges:
+            kept_indices = {node.index for edge in edges for node in nodes if node.index in (edge.source, edge.target)}
+            if not kept_indices:
+                return nodes, edges
+            kept_nodes = [node for node in nodes if node.index in kept_indices]
+            return kept_nodes, edges
+
+        node_lookup = {node.index: node for node in nodes}
+        working_edges = list(edges)
+        working_edges = self._remove_weak_components(working_edges)
+
+        for _ in range(8):
+            degrees = self._node_degrees(working_edges)
+            filtered_edges: list[GraphEdge] = []
+            changed = False
+            for edge in working_edges:
+                if self._should_prune_terminal_edge(edge, degrees, node_lookup):
+                    changed = True
+                    continue
+                filtered_edges.append(edge)
+            filtered_edges = self._remove_weak_components(filtered_edges)
+            if len(filtered_edges) != len(working_edges):
+                changed = True
+            working_edges = filtered_edges
+            if not changed:
+                break
+
+        if self.enforce_tree and working_edges:
+            working_edges = self._maximum_spanning_forest(working_edges)
+
+        kept_indices = {index for edge in working_edges for index in (edge.source, edge.target)}
+        kept_nodes = [node for node in nodes if node.index in kept_indices]
+        return kept_nodes, working_edges
+
+    def _node_degrees(self, edges: list[GraphEdge]) -> dict[int, int]:
+        degrees: dict[int, int] = {}
+        for edge in edges:
+            degrees[edge.source] = degrees.get(edge.source, 0) + 1
+            degrees[edge.target] = degrees.get(edge.target, 0) + 1
+        return degrees
+
+    def _remove_weak_components(self, edges: list[GraphEdge]) -> list[GraphEdge]:
+        if self.prune_mode == "none" or not edges:
+            return edges
+
+        graph = nx.Graph()
+        edge_lookup: dict[tuple[int, int], GraphEdge] = {}
+        for edge in edges:
+            pair = tuple(sorted((edge.source, edge.target)))
+            edge_lookup[pair] = edge
+            graph.add_edge(edge.source, edge.target)
+
+        kept_pairs: set[tuple[int, int]] = set()
+        for component in nx.connected_components(graph):
+            component_edges = [
+                edge_lookup[tuple(sorted((left, right)))]
+                for left, right in graph.subgraph(component).edges()
+            ]
+            if not component_edges:
+                continue
+            component_length = float(sum(len(edge.path) for edge in component_edges))
+            component_max_score = float(max(edge.score for edge in component_edges))
+            if (
+                component_length < float(self.prune_min_component_length)
+                and component_max_score < float(self.prune_component_score)
+            ):
+                continue
+            for edge in component_edges:
+                kept_pairs.add(tuple(sorted((edge.source, edge.target))))
+
+        return [edge for edge in edges if tuple(sorted((edge.source, edge.target))) in kept_pairs]
+
+    def _maximum_spanning_forest(self, edges: list[GraphEdge]) -> list[GraphEdge]:
+        graph = nx.Graph()
+        edge_lookup: dict[tuple[int, int], GraphEdge] = {}
+        for edge in edges:
+            pair = tuple(sorted((edge.source, edge.target)))
+            edge_lookup[pair] = edge
+            length_bonus = min(len(edge.path) / max(float(self.prune_keep_trunk_length), 1.0), 1.0)
+            graph.add_edge(edge.source, edge.target, weight=float(edge.score) + 0.12 * length_bonus)
+
+        kept_pairs: set[tuple[int, int]] = set()
+        for component in nx.connected_components(graph):
+            subgraph = graph.subgraph(component).copy()
+            forest = nx.maximum_spanning_tree(subgraph, weight="weight")
+            for left, right in forest.edges():
+                kept_pairs.add(tuple(sorted((int(left), int(right)))))
+        return [edge for edge in edges if tuple(sorted((edge.source, edge.target))) in kept_pairs]
+
+    def _should_prune_terminal_edge(
+        self,
+        edge: GraphEdge,
+        degrees: dict[int, int],
+        node_lookup: dict[int, GraphNode],
+    ) -> bool:
+        if self.prune_mode == "none":
+            return False
+
+        edge_length = len(edge.path)
+        if edge_length >= int(self.prune_keep_trunk_length) or edge.score >= float(self.prune_keep_edge_score):
+            return False
+
+        leaf_indices = [index for index in (edge.source, edge.target) if degrees.get(index, 0) <= 1]
+        if not leaf_indices:
+            return False
+
+        leaf_nodes = [node_lookup[index] for index in leaf_indices if index in node_lookup]
+        leaf_score = max((node.score for node in leaf_nodes), default=0.0)
+        leaf_kinds = {node.kind for node in leaf_nodes}
+
+        if edge_length <= int(self.prune_min_spur_length) and edge.score < float(self.prune_terminal_score):
+            return True
+        if (
+            "endpoint" in leaf_kinds
+            and edge.score < float(self.prune_terminal_score)
+            and leaf_score < float(self.prune_terminal_node_score)
+        ):
+            return True
+        if self.prune_mode == "reviewer":
+            if edge_length <= int(self.prune_min_spur_length * 1.5) and edge.score < float(self.prune_terminal_score + 0.05):
+                return True
+        return False

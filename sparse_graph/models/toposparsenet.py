@@ -7,8 +7,10 @@ from .backbone import HRUNetBackbone
 from .blocks import (
     BioCausalRouting,
     BranchRelayReasoning,
+    CausalBranchAusterity,
     CounterfactualGeodesicReasoning,
     DenseSparseCoupling,
+    NodeAwareCausalPolicy,
     ResidualBlock,
     TopologyAwareRefinement,
     TopologyConsensusRollout,
@@ -47,6 +49,9 @@ class TopoSparseNet(nn.Module):
             "consensus_rollout",
             "relay_consensus",
             "relay_geodesic",
+            "relay_geodesic_nodecausal",
+            "relay_geodesic_nodecausal_austerity",
+            "relay_geodesic_policy",
         }:
             self.dense_stem = ResidualBlock(feature_channels, feature_channels)
             self.sparse_stem = ResidualBlock(feature_channels, feature_channels)
@@ -64,7 +69,14 @@ class TopoSparseNet(nn.Module):
             )
             self.branch_relay = (
                 BranchRelayReasoning(feature_channels, affinity_channels=affinity_channels)
-                if self.topology_variant in {"relay_consensus", "relay_geodesic"}
+                if self.topology_variant
+                in {
+                    "relay_consensus",
+                    "relay_geodesic",
+                    "relay_geodesic_nodecausal",
+                    "relay_geodesic_nodecausal_austerity",
+                    "relay_geodesic_policy",
+                }
                 else None
             )
             self.counterfactual_geodesic = (
@@ -72,7 +84,23 @@ class TopoSparseNet(nn.Module):
                     feature_channels,
                     embedding_channels=graph_embedding_channels,
                 )
-                if self.topology_variant == "relay_geodesic"
+                if self.topology_variant
+                in {
+                    "relay_geodesic",
+                    "relay_geodesic_nodecausal",
+                    "relay_geodesic_nodecausal_austerity",
+                    "relay_geodesic_policy",
+                }
+                else None
+            )
+            self.node_causal_policy = (
+                NodeAwareCausalPolicy(feature_channels)
+                if self.topology_variant == "relay_geodesic_nodecausal"
+                else None
+            )
+            self.causal_branch_austerity = (
+                CausalBranchAusterity(feature_channels)
+                if self.topology_variant in {"relay_geodesic_nodecausal_austerity", "relay_geodesic_policy"}
                 else None
             )
             if self.topology_variant == "bio_causal_dual":
@@ -99,6 +127,8 @@ class TopoSparseNet(nn.Module):
             self.consensus_rollout = None
             self.branch_relay = None
             self.counterfactual_geodesic = None
+            self.node_causal_policy = None
+            self.causal_branch_austerity = None
         elif self.topology_variant == "none":
             self.coarse_mask_head = None
             self.coarse_skeleton_head = None
@@ -114,6 +144,8 @@ class TopoSparseNet(nn.Module):
             self.consensus_rollout = None
             self.branch_relay = None
             self.counterfactual_geodesic = None
+            self.node_causal_policy = None
+            self.causal_branch_austerity = None
         else:
             raise ValueError(f"Unsupported topology_variant: {self.topology_variant}")
 
@@ -136,6 +168,9 @@ class TopoSparseNet(nn.Module):
             "consensus_rollout",
             "relay_consensus",
             "relay_geodesic",
+            "relay_geodesic_nodecausal",
+            "relay_geodesic_nodecausal_austerity",
+            "relay_geodesic_policy",
         }:
             dense_features = self.dense_stem(features)
             sparse_features = self.sparse_stem(features)
@@ -213,6 +248,40 @@ class TopoSparseNet(nn.Module):
                     geodesic_topology_logits,
                 )
                 outputs.update(graph_outputs)
+            if self.node_causal_policy is not None:
+                policy_topology_logits = [
+                    outputs.get("rollout_mask_logits", coarse_mask_logits),
+                    outputs.get("rollout_skeleton_logits", coarse_skeleton_logits),
+                    outputs.get("rollout_junction_logits", coarse_junction_logits),
+                    outputs.get("rollout_endpoint_logits", coarse_endpoint_logits),
+                    outputs.get("relay_logits", coarse_skeleton_logits),
+                    outputs.get("bridge_logits", coarse_skeleton_logits),
+                    outputs.get("counterfactual_bridge_logits", coarse_skeleton_logits),
+                    outputs.get("path_memory_logits", coarse_skeleton_logits),
+                ]
+                dense_features, sparse_features, policy_outputs = self.node_causal_policy(
+                    dense_features,
+                    sparse_features,
+                    policy_topology_logits,
+                )
+                outputs.update(policy_outputs)
+            if self.causal_branch_austerity is not None:
+                austerity_topology_logits = [
+                    outputs.get("rollout_mask_logits", coarse_mask_logits),
+                    outputs.get("rollout_skeleton_logits", coarse_skeleton_logits),
+                    outputs.get("rollout_junction_logits", coarse_junction_logits),
+                    outputs.get("rollout_endpoint_logits", coarse_endpoint_logits),
+                    outputs.get("relay_logits", coarse_skeleton_logits),
+                    outputs.get("bridge_logits", coarse_skeleton_logits),
+                    outputs.get("counterfactual_bridge_logits", coarse_skeleton_logits),
+                    outputs.get("path_memory_logits", coarse_skeleton_logits),
+                ]
+                dense_features, sparse_features, austerity_outputs = self.causal_branch_austerity(
+                    dense_features,
+                    sparse_features,
+                    austerity_topology_logits,
+                )
+                outputs.update(austerity_outputs)
             outputs.update(
                 {
                     "coarse_mask_logits": coarse_mask_logits,
@@ -250,6 +319,9 @@ class TopoSparseNet(nn.Module):
             "consensus_rollout",
             "relay_consensus",
             "relay_geodesic",
+            "relay_geodesic_nodecausal",
+            "relay_geodesic_nodecausal_austerity",
+            "relay_geodesic_policy",
         }:
             mask_logits = self.mask_head(dense_features)
             skeleton_logits = self.skeleton_head(sparse_features)
@@ -269,6 +341,14 @@ class TopoSparseNet(nn.Module):
                 skeleton_logits = skeleton_logits + 0.20 * outputs["path_memory_logits"]
             if "counterfactual_gate_logits" in outputs:
                 skeleton_logits = skeleton_logits + 0.10 * outputs["counterfactual_gate_logits"]
+            if "causal_saliency_logits" in outputs:
+                skeleton_logits = skeleton_logits + 0.15 * outputs["causal_saliency_logits"]
+            if "dense_sparse_projection_logits" in outputs:
+                skeleton_logits = skeleton_logits + 0.25 * outputs["dense_sparse_projection_logits"]
+            if "branch_keep_logits" in outputs:
+                skeleton_logits = skeleton_logits + 0.15 * outputs["branch_keep_logits"]
+            if "branch_prune_logits" in outputs:
+                skeleton_logits = skeleton_logits - 0.20 * outputs["branch_prune_logits"]
             if "conflict_logits" in outputs:
                 uncertainty_logits = uncertainty_logits + outputs["conflict_logits"]
             outputs.update(

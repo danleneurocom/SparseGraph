@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 import torch
+from skimage.io import imsave
 from torch.nn import functional as F
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         choices=("none", "flips"),
         default="flips",
         help="Use simple flip test-time augmentation for unlabeled robustness.",
+    )
+    parser.add_argument(
+        "--preset",
+        choices=("default", "conservative", "reviewer"),
+        default="default",
+        help="Use a tuned extraction preset. Reviewer favors a cleaner minimal graph.",
     )
     parser.add_argument("--node-threshold", type=float, default=None)
     parser.add_argument("--skeleton-threshold", type=float, default=None)
@@ -248,6 +255,221 @@ def graph_to_json(graph_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def apply_preset(post_cfg: dict[str, Any], preset: str) -> dict[str, Any]:
+    if preset == "default":
+        post_cfg.setdefault("prune_mode", "none")
+        return post_cfg
+
+    if preset == "conservative":
+        post_cfg.update(
+            {
+                "node_threshold": max(float(post_cfg.get("node_threshold", 0.4)), 0.48),
+                "skeleton_threshold": max(float(post_cfg.get("skeleton_threshold", 0.45)), 0.54),
+                "max_neighbor_distance": min(int(post_cfg.get("max_neighbor_distance", 20)), 16),
+                "min_path_support": max(float(post_cfg.get("min_path_support", 0.28)), 0.38),
+                "max_neighbors_per_node": min(int(post_cfg.get("max_neighbors_per_node", 3)), 2),
+                "prune_mode": "conservative",
+                "prune_terminal_score": 0.72,
+                "prune_terminal_node_score": 0.84,
+                "prune_min_spur_length": 36,
+                "prune_keep_trunk_length": 96,
+                "prune_keep_edge_score": 0.92,
+                "prune_min_component_length": 88,
+                "prune_component_score": 0.80,
+                "enforce_tree": False,
+            }
+        )
+        return post_cfg
+
+    if preset == "reviewer":
+        post_cfg.update(
+            {
+                "node_threshold": max(float(post_cfg.get("node_threshold", 0.4)), 0.54),
+                "skeleton_threshold": max(float(post_cfg.get("skeleton_threshold", 0.45)), 0.60),
+                "max_neighbor_distance": min(int(post_cfg.get("max_neighbor_distance", 20)), 14),
+                "min_path_support": max(float(post_cfg.get("min_path_support", 0.28)), 0.46),
+                "max_neighbors_per_node": min(int(post_cfg.get("max_neighbors_per_node", 3)), 2),
+                "prune_mode": "reviewer",
+                "prune_terminal_score": 0.78,
+                "prune_terminal_node_score": 0.88,
+                "prune_min_spur_length": 44,
+                "prune_keep_trunk_length": 108,
+                "prune_keep_edge_score": 0.94,
+                "prune_min_component_length": 104,
+                "prune_component_score": 0.84,
+                "enforce_tree": True,
+            }
+        )
+        return post_cfg
+
+    return post_cfg
+
+
+def _normalize_display(image: np.ndarray) -> np.ndarray:
+    image = np.asarray(image, dtype=np.float32)
+    image = np.nan_to_num(image, copy=False)
+    low = float(np.percentile(image, 1.0))
+    high = float(np.percentile(image, 99.0))
+    if high <= low:
+        return np.zeros_like(image, dtype=np.float32)
+    return np.clip((image - low) / (high - low), 0.0, 1.0).astype(np.float32)
+
+
+def summary_to_rgb(summary: np.ndarray) -> np.ndarray:
+    summary = np.asarray(summary, dtype=np.float32)
+    if summary.ndim != 3:
+        raise ValueError(f"Expected [C, H, W] summary, got shape {summary.shape}")
+
+    if summary.shape[0] >= 4:
+        channels = [summary[1], summary[0], summary[3]]
+    elif summary.shape[0] == 3:
+        channels = [summary[0], summary[1], summary[2]]
+    elif summary.shape[0] == 2:
+        channels = [summary[0], summary[1], summary[0]]
+    else:
+        channels = [summary[0], summary[0], summary[0]]
+    return np.stack([_normalize_display(channel) for channel in channels], axis=-1)
+
+
+def _paint_square(
+    canvas: np.ndarray,
+    y: int,
+    x: int,
+    color: tuple[float, float, float],
+    radius: int,
+) -> None:
+    height, width, _ = canvas.shape
+    y0 = max(0, y - radius)
+    y1 = min(height, y + radius + 1)
+    x0 = max(0, x - radius)
+    x1 = min(width, x + radius + 1)
+    canvas[y0:y1, x0:x1] = np.asarray(color, dtype=np.float32)
+
+
+def _stack_panels(panels: list[np.ndarray], separator_width: int = 8) -> np.ndarray:
+    separator = np.ones((panels[0].shape[0], separator_width, 3), dtype=np.float32)
+    stitched: list[np.ndarray] = []
+    for index, panel in enumerate(panels):
+        stitched.append(np.clip(panel, 0.0, 1.0))
+        if index < len(panels) - 1:
+            stitched.append(separator)
+    return np.concatenate(stitched, axis=1)
+
+
+def render_extraction_visual(
+    summary: np.ndarray,
+    mask_prob: np.ndarray,
+    skeleton_prob: np.ndarray,
+    graph_result: dict[str, Any],
+    dense_sparse_projection_prob: np.ndarray | None = None,
+    skeleton_threshold: float = 0.5,
+) -> dict[str, np.ndarray]:
+    original_rgb = summary_to_rgb(summary)
+    dense_rgb = original_rgb * 0.78
+    sparse_rgb = original_rgb * 0.60
+    graph_rgb = original_rgb * 0.72
+    sparse_only_rgb = np.zeros_like(original_rgb, dtype=np.float32)
+    graph_only_rgb = np.zeros_like(original_rgb, dtype=np.float32)
+
+    mask_alpha = np.clip(mask_prob * 0.22, 0.0, 0.22)[..., None]
+    mask_color = np.array([1.0, 0.45, 0.12], dtype=np.float32)
+    dense_rgb = dense_rgb * (1.0 - mask_alpha) + mask_alpha * mask_color
+
+    skeleton_alpha = np.clip(skeleton_prob * 0.90, 0.0, 0.90)[..., None]
+    skeleton_color = np.array([0.08, 0.92, 1.0], dtype=np.float32)
+    sparse_rgb = sparse_rgb * (1.0 - 0.40 * skeleton_alpha) + skeleton_alpha * skeleton_color
+    graph_rgb = graph_rgb * (1.0 - 0.40 * skeleton_alpha) + skeleton_alpha * skeleton_color
+    sparse_only_rgb = sparse_only_rgb + skeleton_alpha * skeleton_color
+
+    if dense_sparse_projection_prob is not None:
+        projection_alpha = np.clip(dense_sparse_projection_prob * 0.25, 0.0, 0.25)[..., None]
+        projection_color = np.array([0.92, 0.20, 0.88], dtype=np.float32)
+        sparse_rgb = sparse_rgb * (1.0 - projection_alpha) + projection_alpha * projection_color
+        graph_rgb = graph_rgb * (1.0 - 0.5 * projection_alpha) + 0.5 * projection_alpha * projection_color
+        sparse_only_rgb = sparse_only_rgb + np.clip(dense_sparse_projection_prob * 0.45, 0.0, 0.45)[..., None] * projection_color
+
+    binary_skeleton = (skeleton_prob >= float(skeleton_threshold)).astype(np.float32)
+    binary_skeleton_rgb = np.repeat(binary_skeleton[..., None], 3, axis=2)
+
+    for edge in graph_result["edges"]:
+        for y, x in edge.path:
+            _paint_square(graph_rgb, int(y), int(x), color=(1.0, 0.88, 0.18), radius=1)
+            _paint_square(graph_only_rgb, int(y), int(x), color=(1.0, 0.88, 0.18), radius=1)
+    for node in graph_result["nodes"]:
+        color = (1.0, 0.18, 0.20) if node.kind == "junction" else (0.15, 1.0, 0.35)
+        _paint_square(graph_rgb, int(node.y), int(node.x), color=color, radius=2)
+        _paint_square(graph_only_rgb, int(node.y), int(node.x), color=color, radius=2)
+
+    dense_rgb = np.clip(dense_rgb, 0.0, 1.0)
+    sparse_rgb = np.clip(sparse_rgb, 0.0, 1.0)
+    graph_rgb = np.clip(graph_rgb, 0.0, 1.0)
+    sparse_only_rgb = np.clip(sparse_only_rgb, 0.0, 1.0)
+    graph_only_rgb = np.clip(graph_only_rgb, 0.0, 1.0)
+    comparison_rgb = _stack_panels([original_rgb, graph_rgb])
+    storyboard_rgb = _stack_panels([original_rgb, dense_rgb, sparse_rgb, graph_rgb])
+    sparse_storyboard_rgb = _stack_panels([sparse_only_rgb, binary_skeleton_rgb, graph_only_rgb])
+    return {
+        "original": original_rgb,
+        "dense": dense_rgb,
+        "sparse": sparse_rgb,
+        "sparse_only": sparse_only_rgb,
+        "binary_skeleton": binary_skeleton_rgb,
+        "graph": graph_rgb,
+        "graph_only": graph_only_rgb,
+        "comparison": comparison_rgb,
+        "storyboard": storyboard_rgb,
+        "sparse_storyboard": sparse_storyboard_rgb,
+    }
+
+
+def save_visual_outputs(
+    output_dir: Path,
+    summary: np.ndarray,
+    mask_prob: np.ndarray,
+    skeleton_prob: np.ndarray,
+    graph_result: dict[str, Any],
+    dense_sparse_projection_prob: np.ndarray | None = None,
+    skeleton_threshold: float = 0.5,
+) -> dict[str, str]:
+    visuals = render_extraction_visual(
+        summary=summary,
+        mask_prob=mask_prob,
+        skeleton_prob=skeleton_prob,
+        graph_result=graph_result,
+        dense_sparse_projection_prob=dense_sparse_projection_prob,
+        skeleton_threshold=skeleton_threshold,
+    )
+    visual_paths = {
+        "original_view": output_dir / "original_view.png",
+        "dense_view": output_dir / "dense_view.png",
+        "sparse_view": output_dir / "sparse_view.png",
+        "sparse_only_view": output_dir / "sparse_only.png",
+        "binary_skeleton_view": output_dir / "binary_skeleton.png",
+        "graph_view": output_dir / "graph_view.png",
+        "graph_only_view": output_dir / "graph_only.png",
+        "extraction_view": output_dir / "extraction_view.png",
+        "comparison_view": output_dir / "comparison.png",
+        "storyboard_view": output_dir / "storyboard.png",
+        "sparse_storyboard_view": output_dir / "sparse_storyboard.png",
+    }
+    visual_arrays = {
+        "original_view": visuals["original"],
+        "dense_view": visuals["dense"],
+        "sparse_view": visuals["sparse"],
+        "sparse_only_view": visuals["sparse_only"],
+        "binary_skeleton_view": visuals["binary_skeleton"],
+        "graph_view": visuals["graph"],
+        "graph_only_view": visuals["graph_only"],
+        "extraction_view": visuals["graph"],
+        "comparison_view": visuals["comparison"],
+        "storyboard_view": visuals["storyboard"],
+        "sparse_storyboard_view": visuals["sparse_storyboard"],
+    }
+    for key, path in visual_paths.items():
+        imsave(path, (visual_arrays[key] * 255.0).astype(np.uint8), check_contrast=False)
+    return {key: str(path) for key, path in visual_paths.items()}
+
+
 def main() -> None:
     args = parse_args()
     input_path = Path(args.input)
@@ -275,7 +497,7 @@ def main() -> None:
         calibration,
     )
 
-    post_cfg = resolve_postprocess_config(config, calibration)
+    post_cfg = apply_preset(resolve_postprocess_config(config, calibration), args.preset)
     overrides = {
         "node_threshold": args.node_threshold,
         "skeleton_threshold": args.skeleton_threshold,
@@ -296,6 +518,11 @@ def main() -> None:
     uncertainty_prob = torch.sigmoid(predictions["uncertainty_logits"])[0, 0].detach().cpu().numpy()
     affinity = predictions["affinity"][0].detach().cpu().numpy()
     confidence_map = np.clip((mask_prob + skeleton_prob) * 0.5 - 0.5 * uncertainty_prob, 0.0, 1.0)
+    dense_sparse_projection_prob = None
+    if "dense_sparse_projection_logits" in predictions:
+        dense_sparse_projection_prob = (
+            torch.sigmoid(predictions["dense_sparse_projection_logits"])[0, 0].detach().cpu().numpy()
+        )
 
     extra_outputs: dict[str, np.ndarray] = {}
     for key in (
@@ -303,6 +530,10 @@ def main() -> None:
         "activity_prior_logits",
         "agreement_logits",
         "conflict_logits",
+        "node_capacity_logits",
+        "causal_saliency_logits",
+        "dense_sparse_projection_logits",
+        "path_memory_logits",
     ):
         if key in predictions:
             export_key = key.replace("_logits", "_prob")
@@ -323,8 +554,32 @@ def main() -> None:
         **extra_outputs,
     )
 
+    visual_paths = save_visual_outputs(
+        output_dir=output_dir,
+        summary=image[0].cpu().numpy(),
+        mask_prob=mask_prob.astype(np.float32),
+        skeleton_prob=skeleton_prob.astype(np.float32),
+        graph_result=graph_result,
+        dense_sparse_projection_prob=dense_sparse_projection_prob.astype(np.float32)
+        if dense_sparse_projection_prob is not None
+        else None,
+        skeleton_threshold=float(post_cfg.get("skeleton_threshold", 0.5)),
+    )
+
     with (output_dir / "graph.json").open("w", encoding="utf-8") as handle:
         json.dump(graph_to_json(graph_result), handle, indent=2)
+    if "raw_nodes" in graph_result and "raw_edges" in graph_result:
+        with (output_dir / "graph_raw.json").open("w", encoding="utf-8") as handle:
+            json.dump(
+                graph_to_json(
+                    {
+                        "nodes": graph_result["raw_nodes"],
+                        "edges": graph_result["raw_edges"],
+                    }
+                ),
+                handle,
+                indent=2,
+            )
 
     metadata = {
         "input_path": str(input_path),
@@ -333,11 +588,15 @@ def main() -> None:
         "device": str(device),
         "input_mode": input_mode,
         "tta": args.tta,
+        "preset": args.preset,
         "num_nodes": len(graph_result["nodes"]),
         "num_edges": len(graph_result["edges"]),
+        "raw_num_nodes": len(graph_result.get("raw_nodes", graph_result["nodes"])),
+        "raw_num_edges": len(graph_result.get("raw_edges", graph_result["edges"])),
         "mean_confidence": float(confidence_map.mean()),
         "model_config": config["model"],
         "postprocess": post_cfg,
+        "visuals": visual_paths,
     }
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2)

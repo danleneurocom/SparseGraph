@@ -79,6 +79,10 @@ def _match_points(
 ) -> tuple[int, int, int]:
     if not pred_points and not target_points:
         return 0, 0, 0
+    if not pred_points:
+        return 0, 0, len(target_points)
+    if not target_points:
+        return 0, len(pred_points), 0
 
     pred_array = np.asarray(pred_points, dtype=np.float32)
     target_array = np.asarray(target_points, dtype=np.float32)

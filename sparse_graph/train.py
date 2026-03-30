@@ -90,6 +90,24 @@ def build_model(config: dict[str, Any]) -> nn.Module:
     )
 
 
+def load_compatible_state_dict(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> tuple[list[str], list[str], list[str]]:
+    model_state = model.state_dict()
+    filtered_state: dict[str, torch.Tensor] = {}
+    skipped_mismatch: list[str] = []
+    unexpected: list[str] = []
+    for key, value in state_dict.items():
+        if key not in model_state:
+            unexpected.append(key)
+            continue
+        if model_state[key].shape != value.shape:
+            skipped_mismatch.append(key)
+            continue
+        filtered_state[key] = value
+    missing = sorted(set(model_state.keys()) - set(filtered_state.keys()))
+    model.load_state_dict(filtered_state, strict=False)
+    return missing, unexpected, skipped_mismatch
+
+
 def run_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -198,10 +216,10 @@ def main() -> None:
     if init_checkpoint:
         checkpoint = torch.load(init_checkpoint, map_location=device)
         state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        missing, unexpected, skipped_mismatch = load_compatible_state_dict(model, state_dict)
         print(
             f"Initialized model from {init_checkpoint} | "
-            f"missing={len(missing)} unexpected={len(unexpected)}"
+            f"missing={len(missing)} unexpected={len(unexpected)} skipped_mismatch={len(skipped_mismatch)}"
         )
     objective = TopoSparseObjective(config["loss"])
     optimizer = torch.optim.AdamW(
