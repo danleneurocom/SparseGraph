@@ -14,6 +14,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from sparse_graph.config import deep_update
+from sparse_graph.calibration import (
+    apply_temperature_scaling,
+    load_calibration,
+    resolve_metric_thresholds,
+)
 from sparse_graph.losses import TopoSparseObjective
 from sparse_graph.metrics import publication_metrics
 from sparse_graph.train import build_datasets, build_model
@@ -34,6 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--json-out", default=None, help="Optional report path. Defaults next to the checkpoint.")
+    parser.add_argument("--calibration-json", default=None, help="Optional temperature/threshold calibration file.")
     return parser.parse_args()
 
 
@@ -57,6 +63,7 @@ def main() -> None:
     checkpoint_path = Path(args.checkpoint)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = checkpoint["config"]
+    calibration = load_calibration(args.calibration_json)
 
     overrides = {"data": {}}
     if args.train_dir is not None:
@@ -85,15 +92,17 @@ def main() -> None:
 
     objective = TopoSparseObjective(config["loss"])
     tracker = MetricTracker()
+    metric_thresholds = resolve_metric_thresholds(config, calibration)
     with torch.inference_mode():
         for batch in tqdm(loader, desc=f"eval-{args.split}", leave=False):
             batch = move_batch_to_device(batch, device)
-            predictions = model(batch["image"])
+            predictions = apply_temperature_scaling(model(batch["image"]), calibration)
             _, metrics = objective(predictions, batch)
             metrics.update(
                 publication_metrics(
                     predictions,
                     batch,
+                    thresholds=metric_thresholds,
                     skeleton_iterations=int(config["loss"].get("skeleton_iterations", 10)),
                 )
             )
@@ -103,6 +112,7 @@ def main() -> None:
         "checkpoint": str(checkpoint_path),
         "epoch": int(checkpoint.get("epoch", -1)),
         "split": args.split,
+        "calibration": str(args.calibration_json) if args.calibration_json else None,
         "metrics": tracker.averages(),
     }
 

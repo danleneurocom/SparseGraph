@@ -20,6 +20,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "topology_variant": "none",
         "morphology_channels": [0, 1],
         "activity_channels": [2, 3],
+        "graph_embedding_channels": 16,
     },
     "data": {
         "dataset_type": "synthetic",
@@ -37,6 +38,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "weight_decay": 1e-4,
         "grad_clip": 1.0,
         "log_every": 10,
+        "init_checkpoint": "",
     },
     "loss": {
         "mask": 1.0,
@@ -57,10 +59,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "postprocess": {
         "node_threshold": 0.5,
+        "mask_threshold": 0.5,
         "skeleton_threshold": 0.5,
+        "junction_threshold": 0.5,
+        "endpoint_threshold": 0.5,
         "max_neighbor_distance": 24,
         "min_path_support": 0.35,
         "max_neighbors_per_node": 2,
+        "decode_mode": "geodesic",
+        "nms_radius": 4,
+        "max_path_ratio": 1.85,
+        "affinity_weight": 0.2,
+        "uncertainty_weight": 0.75,
+        "bridge_weight": 0.2,
+        "relay_weight": 0.15,
+        "mask_weight": 0.1,
+        "relation_weight": 0.55,
     },
 }
 

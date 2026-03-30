@@ -4,6 +4,8 @@ from dataclasses import dataclass
 
 import numpy as np
 import torch
+from scipy import ndimage
+from scipy.spatial import cKDTree
 from torch.nn import functional as F
 
 from .losses import soft_skeletonize
@@ -15,28 +17,9 @@ def _safe_divide(numerator: float, denominator: float, eps: float = 1e-6) -> flo
 
 def _connected_components(binary: np.ndarray) -> tuple[np.ndarray, int]:
     binary = binary.astype(bool)
-    labels = np.zeros(binary.shape, dtype=np.int32)
-    height, width = binary.shape
-    component_index = 0
-    for y in range(height):
-        for x in range(width):
-            if not binary[y, x] or labels[y, x] != 0:
-                continue
-            component_index += 1
-            stack = [(y, x)]
-            labels[y, x] = component_index
-            while stack:
-                cy, cx = stack.pop()
-                for dy in (-1, 0, 1):
-                    for dx in (-1, 0, 1):
-                        if dy == 0 and dx == 0:
-                            continue
-                        ny = cy + dy
-                        nx = cx + dx
-                        if 0 <= ny < height and 0 <= nx < width and binary[ny, nx] and labels[ny, nx] == 0:
-                            labels[ny, nx] = component_index
-                            stack.append((ny, nx))
-    return labels, component_index
+    structure = np.ones((3, 3), dtype=np.int8)
+    labels, component_index = ndimage.label(binary, structure=structure)
+    return labels.astype(np.int32, copy=False), int(component_index)
 
 
 def _neighbor_degree(binary: np.ndarray) -> np.ndarray:
@@ -60,6 +43,35 @@ def _peak_points(logits: torch.Tensor, threshold: float = 0.5) -> list[tuple[int
     return list(zip(ys.tolist(), xs.tolist()))
 
 
+def _brier_score_from_probs(pred_probs: torch.Tensor, target_probs: torch.Tensor) -> float:
+    return float(torch.mean((pred_probs - target_probs) ** 2).detach().cpu().item())
+
+
+def _expected_calibration_error_from_probs(
+    pred_probs: torch.Tensor,
+    target_probs: torch.Tensor,
+    num_bins: int = 10,
+) -> float:
+    probs = pred_probs.detach().flatten().cpu()
+    target = target_probs.detach().flatten().cpu()
+    if probs.numel() == 0:
+        return 0.0
+
+    ece = 0.0
+    bin_edges = torch.linspace(0.0, 1.0, num_bins + 1)
+    for left, right in zip(bin_edges[:-1], bin_edges[1:]):
+        if right == 1.0:
+            mask = (probs >= left) & (probs <= right)
+        else:
+            mask = (probs >= left) & (probs < right)
+        if not torch.any(mask):
+            continue
+        bin_confidence = probs[mask].mean()
+        bin_accuracy = target[mask].mean()
+        ece += float(mask.float().mean().item()) * float(abs(bin_confidence - bin_accuracy).item())
+    return ece
+
+
 def _match_points(
     pred_points: list[tuple[int, int]],
     target_points: list[tuple[int, int]],
@@ -68,23 +80,29 @@ def _match_points(
     if not pred_points and not target_points:
         return 0, 0, 0
 
+    pred_array = np.asarray(pred_points, dtype=np.float32)
+    target_array = np.asarray(target_points, dtype=np.float32)
+    tree = cKDTree(target_array)
+
+    candidate_matches: list[tuple[float, int, int]] = []
+    for pred_index, neighbors in enumerate(tree.query_ball_point(pred_array, r=tolerance)):
+        if not neighbors:
+            continue
+        deltas = target_array[neighbors] - pred_array[pred_index]
+        distances = np.linalg.norm(deltas, axis=1)
+        for neighbor_index, distance in zip(neighbors, distances.tolist()):
+            candidate_matches.append((float(distance), pred_index, int(neighbor_index)))
+
+    candidate_matches.sort(key=lambda item: item[0])
+    matched_preds: set[int] = set()
     matched_targets: set[int] = set()
     true_positive = 0
-    for pred_y, pred_x in pred_points:
-        best_index = None
-        best_distance = None
-        for index, (target_y, target_x) in enumerate(target_points):
-            if index in matched_targets:
-                continue
-            distance = float(np.hypot(pred_y - target_y, pred_x - target_x))
-            if distance > tolerance:
-                continue
-            if best_distance is None or distance < best_distance:
-                best_distance = distance
-                best_index = index
-        if best_index is not None:
-            matched_targets.add(best_index)
-            true_positive += 1
+    for _, pred_index, target_index in candidate_matches:
+        if pred_index in matched_preds or target_index in matched_targets:
+            continue
+        matched_preds.add(pred_index)
+        matched_targets.add(target_index)
+        true_positive += 1
 
     false_positive = max(len(pred_points) - true_positive, 0)
     false_negative = max(len(target_points) - true_positive, 0)
@@ -140,9 +158,15 @@ class GraphProxyMetrics:
 def graph_proxy_metrics(
     predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-    threshold: float = 0.5,
+    thresholds: dict[str, float] | None = None,
     node_tolerance: float = 3.0,
 ) -> GraphProxyMetrics:
+    thresholds = thresholds or {}
+    mask_threshold = float(thresholds.get("mask_threshold", 0.5))
+    skeleton_threshold = float(thresholds.get("skeleton_threshold", 0.5))
+    junction_threshold = float(thresholds.get("junction_threshold", 0.5))
+    endpoint_threshold = float(thresholds.get("endpoint_threshold", 0.5))
+
     mask_prob = torch.sigmoid(predictions["mask_logits"])
     skeleton_prob = torch.sigmoid(predictions["skeleton_logits"])
     junction_prob = torch.sigmoid(predictions["junction_logits"])
@@ -156,11 +180,15 @@ def graph_proxy_metrics(
 
     batch_size = int(mask_prob.shape[0])
     for index in range(batch_size):
-        pred_skeleton = (skeleton_prob[index, 0] >= threshold).detach().cpu().numpy().astype(np.uint8)
-        target_skeleton = (batch["skeleton"][index, 0] >= threshold).detach().cpu().numpy().astype(np.uint8)
+        pred_skeleton = (
+            (skeleton_prob[index, 0] >= skeleton_threshold).detach().cpu().numpy().astype(np.uint8)
+        )
+        target_skeleton = (
+            (batch["skeleton"][index, 0] >= skeleton_threshold).detach().cpu().numpy().astype(np.uint8)
+        )
 
-        pred_mask = (mask_prob[index, 0] >= threshold).detach().cpu().numpy().astype(np.uint8)
-        target_mask = (batch["mask"][index, 0] >= threshold).detach().cpu().numpy().astype(np.uint8)
+        pred_mask = (mask_prob[index, 0] >= mask_threshold).detach().cpu().numpy().astype(np.uint8)
+        target_mask = (batch["mask"][index, 0] >= mask_threshold).detach().cpu().numpy().astype(np.uint8)
 
         _, pred_components = _connected_components(pred_skeleton)
         _, target_components = _connected_components(target_skeleton)
@@ -176,8 +204,8 @@ def graph_proxy_metrics(
         target_length = float(target_skeleton.sum())
         length_errors.append(abs(pred_length - target_length) / max(target_length, 1.0))
 
-        pred_junction_points = _peak_points(junction_prob[index, 0], threshold=threshold)
-        target_junction_points = _peak_points(batch["junction"][index, 0], threshold=threshold)
+        pred_junction_points = _peak_points(junction_prob[index, 0], threshold=junction_threshold)
+        target_junction_points = _peak_points(batch["junction"][index, 0], threshold=junction_threshold)
         junction_tp, junction_fp, junction_fn = _match_points(
             pred_junction_points,
             target_junction_points,
@@ -189,8 +217,8 @@ def graph_proxy_metrics(
             _safe_divide(2.0 * junction_precision * junction_recall, junction_precision + junction_recall)
         )
 
-        pred_endpoint_points = _peak_points(endpoint_prob[index, 0], threshold=threshold)
-        target_endpoint_points = _peak_points(batch["endpoint"][index, 0], threshold=threshold)
+        pred_endpoint_points = _peak_points(endpoint_prob[index, 0], threshold=endpoint_threshold)
+        target_endpoint_points = _peak_points(batch["endpoint"][index, 0], threshold=endpoint_threshold)
         endpoint_tp, endpoint_fp, endpoint_fn = _match_points(
             pred_endpoint_points,
             target_endpoint_points,
@@ -217,16 +245,24 @@ def graph_proxy_metrics(
 def publication_metrics(
     predictions: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
-    threshold: float = 0.5,
+    thresholds: dict[str, float] | None = None,
     skeleton_iterations: int = 10,
 ) -> dict[str, float]:
+    thresholds = thresholds or {}
+    mask_threshold = float(thresholds.get("mask_threshold", 0.5))
+    skeleton_threshold = float(thresholds.get("skeleton_threshold", 0.5))
+    junction_threshold = float(thresholds.get("junction_threshold", 0.5))
+    endpoint_threshold = float(thresholds.get("endpoint_threshold", 0.5))
+
     mask_prob = torch.sigmoid(predictions["mask_logits"])
     skeleton_prob = torch.sigmoid(predictions["skeleton_logits"])
+    junction_prob = torch.sigmoid(predictions["junction_logits"])
+    endpoint_prob = torch.sigmoid(predictions["endpoint_logits"])
 
-    mask_binary = (mask_prob >= threshold).detach().cpu().numpy()
-    skeleton_binary = (skeleton_prob >= threshold).detach().cpu().numpy()
-    target_mask = (batch["mask"] >= threshold).detach().cpu().numpy()
-    target_skeleton = (batch["skeleton"] >= threshold).detach().cpu().numpy()
+    mask_binary = (mask_prob >= mask_threshold).detach().cpu().numpy()
+    skeleton_binary = (skeleton_prob >= skeleton_threshold).detach().cpu().numpy()
+    target_mask = (batch["mask"] >= mask_threshold).detach().cpu().numpy()
+    target_skeleton = (batch["skeleton"] >= skeleton_threshold).detach().cpu().numpy()
 
     mask_precision_values: list[float] = []
     mask_recall_values: list[float] = []
@@ -253,7 +289,7 @@ def publication_metrics(
         skeleton_recall_values.append(skeleton_recall)
         skeleton_f1_values.append(skeleton_f1)
 
-    graph_metrics = graph_proxy_metrics(predictions, batch, threshold=threshold)
+    graph_metrics = graph_proxy_metrics(predictions, batch, thresholds=thresholds)
     cldice = float(
         cldice_score_from_probs(mask_prob, batch["mask"], iterations=skeleton_iterations).detach().cpu().item()
     )
@@ -266,6 +302,20 @@ def publication_metrics(
         "skeleton_recall": float(np.mean(skeleton_recall_values)) if skeleton_recall_values else 0.0,
         "skeleton_f1": float(np.mean(skeleton_f1_values)) if skeleton_f1_values else 0.0,
         "cldice": cldice,
+        "mask_brier": _brier_score_from_probs(mask_prob, batch["mask"]),
+        "skeleton_brier": _brier_score_from_probs(skeleton_prob, batch["skeleton"]),
+        "junction_brier": _brier_score_from_probs(junction_prob, batch["junction"]),
+        "endpoint_brier": _brier_score_from_probs(endpoint_prob, batch["endpoint"]),
+        "mask_ece": _expected_calibration_error_from_probs(mask_prob, batch["mask"]),
+        "skeleton_ece": _expected_calibration_error_from_probs(skeleton_prob, batch["skeleton"]),
+        "junction_ece": _expected_calibration_error_from_probs(
+            junction_prob,
+            (batch["junction"] >= junction_threshold).float(),
+        ),
+        "endpoint_ece": _expected_calibration_error_from_probs(
+            endpoint_prob,
+            (batch["endpoint"] >= endpoint_threshold).float(),
+        ),
         "junction_f1": graph_metrics.junction_f1,
         "endpoint_f1": graph_metrics.endpoint_f1,
         "component_error": graph_metrics.component_error,

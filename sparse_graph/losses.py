@@ -98,6 +98,116 @@ def binary_dice_score_from_logits(
     return score.mean()
 
 
+def _gather_point_features(feature_map: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
+    batch_size, channels, height, width = feature_map.shape
+    y = points[..., 0].long().clamp(0, height - 1)
+    x = points[..., 1].long().clamp(0, width - 1)
+    flat_index = (y * width + x).view(batch_size, 1, -1).expand(-1, channels, -1)
+    gathered = torch.gather(feature_map.view(batch_size, channels, -1), 2, flat_index)
+    return gathered.view(batch_size, channels, *points.shape[1:-1]).permute(0, *range(2, points.ndim), 1)
+
+
+def _masked_path_mean(feature_map: torch.Tensor, path_points: torch.Tensor, path_mask: torch.Tensor) -> torch.Tensor:
+    gathered = _gather_point_features(feature_map, path_points)
+    while path_mask.ndim < gathered.ndim:
+        path_mask = path_mask.unsqueeze(-1)
+    weighted = gathered * path_mask
+    denominator = path_mask.sum(dim=-2).clamp_min(1.0)
+    return weighted.sum(dim=-2) / denominator
+
+
+def compute_graph_relation_logits(
+    predictions: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    required_prediction_keys = {"graph_query_embeddings", "graph_key_embeddings", "path_memory_logits"}
+    required_batch_keys = {
+        "graph_pair_points",
+        "graph_pair_path_points",
+        "graph_pair_path_mask",
+        "graph_pair_valid",
+    }
+    if not required_prediction_keys.issubset(predictions) or not required_batch_keys.issubset(batch):
+        return None
+
+    pair_points = batch["graph_pair_points"]
+    pair_path_points = batch["graph_pair_path_points"]
+    pair_path_mask = batch["graph_pair_path_mask"]
+    valid_mask = batch["graph_pair_valid"].float()
+
+    query_embeddings = F.normalize(predictions["graph_query_embeddings"], dim=1)
+    key_embeddings = F.normalize(predictions["graph_key_embeddings"], dim=1)
+    path_memory_logits = predictions["path_memory_logits"]
+    skeleton_prob = torch.sigmoid(predictions["skeleton_logits"])
+    relay_prob = (
+        torch.sigmoid(predictions["relay_logits"]) if "relay_logits" in predictions else skeleton_prob
+    )
+    bridge_prob = (
+        torch.sigmoid(predictions["bridge_logits"])
+        if "bridge_logits" in predictions
+        else torch.zeros_like(skeleton_prob)
+    )
+    uncertainty_prob = (
+        torch.sigmoid(predictions["uncertainty_logits"])
+        if "uncertainty_logits" in predictions
+        else torch.zeros_like(skeleton_prob)
+    )
+    node_prob = torch.maximum(
+        torch.sigmoid(predictions["junction_logits"]),
+        torch.sigmoid(predictions["endpoint_logits"]),
+    )
+    counterfactual_prob = (
+        torch.sigmoid(predictions["counterfactual_gate_logits"])
+        if "counterfactual_gate_logits" in predictions
+        else torch.zeros_like(skeleton_prob)
+    )
+
+    src_points = pair_points[:, :, 0]
+    dst_points = pair_points[:, :, 1]
+    q_src = _gather_point_features(query_embeddings, src_points)
+    q_dst = _gather_point_features(query_embeddings, dst_points)
+    k_src = _gather_point_features(key_embeddings, src_points)
+    k_dst = _gather_point_features(key_embeddings, dst_points)
+    node_support = 0.5 * (
+        _gather_point_features(node_prob, src_points).squeeze(-1)
+        + _gather_point_features(node_prob, dst_points).squeeze(-1)
+    )
+    path_memory = _masked_path_mean(path_memory_logits, pair_path_points, pair_path_mask).squeeze(-1)
+    path_skeleton = _masked_path_mean(skeleton_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    path_relay = _masked_path_mean(relay_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    path_bridge = _masked_path_mean(bridge_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    path_uncertainty = _masked_path_mean(uncertainty_prob, pair_path_points, pair_path_mask).squeeze(-1)
+    counterfactual_support = _masked_path_mean(
+        counterfactual_prob,
+        pair_path_points,
+        pair_path_mask,
+    ).squeeze(-1)
+
+    embedding_dim = max(int(q_src.shape[-1]), 1)
+    compatibility = 0.5 * (
+        (q_src * k_dst).sum(dim=-1) + (q_dst * k_src).sum(dim=-1)
+    ) / (embedding_dim**0.5)
+
+    spatial_extent = float(max(predictions["mask_logits"].shape[-2:]))
+    distance = torch.linalg.norm(
+        src_points.float() - dst_points.float(),
+        dim=-1,
+    ) / max(spatial_extent, 1.0)
+
+    graph_logits = (
+        1.35 * compatibility
+        + 1.00 * path_memory
+        + 0.85 * path_skeleton
+        + 0.35 * path_relay
+        + 0.20 * path_bridge
+        + 0.25 * counterfactual_support
+        + 0.20 * node_support
+        - 0.45 * path_uncertainty
+        - 0.35 * distance
+    )
+    return graph_logits, valid_mask
+
+
 class TopoSparseObjective(nn.Module):
     def __init__(self, weights: dict[str, Any]) -> None:
         super().__init__()
@@ -258,12 +368,28 @@ class TopoSparseObjective(nn.Module):
             causal_loss = causal_loss + (skeleton_probs * activity_only).mean()
             causal_loss = causal_loss + 0.5 * (mask_probs * conflict_probs).mean()
 
-        if "graph_target" in batch and "graph_logits" in predictions:
-            graph_loss = F.binary_cross_entropy_with_logits(
-                predictions["graph_logits"], batch["graph_target"]
+        graph_metrics = compute_graph_relation_logits(predictions, batch)
+        if graph_metrics is not None and "graph_target" in batch:
+            graph_logits, graph_valid = graph_metrics
+            graph_target = batch["graph_target"].float()
+            graph_weight = graph_valid.float()
+            graph_loss_map = F.binary_cross_entropy_with_logits(
+                graph_logits,
+                graph_target,
+                reduction="none",
             )
+            graph_loss = (graph_loss_map * graph_weight).sum() / graph_weight.sum().clamp_min(1.0)
+            predictions["graph_logits"] = graph_logits.detach()
+            graph_probs = torch.sigmoid(graph_logits)
+            graph_pred = (graph_probs >= 0.5).float()
+            graph_correct = ((graph_pred == graph_target).float() * graph_weight).sum()
+            graph_accuracy = graph_correct / graph_weight.sum().clamp_min(1.0)
+            positive_weight = (graph_target * graph_weight).sum().clamp_min(1.0)
+            graph_recall = ((graph_pred * graph_target) * graph_weight).sum() / positive_weight
         else:
             graph_loss = predictions["mask_logits"].new_tensor(0.0)
+            graph_accuracy = predictions["mask_logits"].new_tensor(0.0)
+            graph_recall = predictions["mask_logits"].new_tensor(0.0)
 
         total = (
             self.weights.get("mask", 1.0) * mask_loss
@@ -298,6 +424,8 @@ class TopoSparseObjective(nn.Module):
             "causal_loss": causal_loss,
             "relay_loss": relay_loss,
             "graph_loss": graph_loss,
+            "graph_accuracy": graph_accuracy,
+            "graph_recall": graph_recall,
             "mask_dice": binary_dice_score_from_logits(predictions["mask_logits"], batch["mask"]),
             "skeleton_dice": binary_dice_score_from_logits(
                 predictions["skeleton_logits"], batch["skeleton"]

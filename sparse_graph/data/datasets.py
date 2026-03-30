@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+from scipy import ndimage
 import torch
 from torch.nn import functional as F
 from torch.utils.data import Dataset
@@ -23,6 +24,235 @@ def _line_points(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int
     ys = np.linspace(y0, y1, steps).round().astype(int)
     xs = np.linspace(x0, x1, steps).round().astype(int)
     return list(zip(ys.tolist(), xs.tolist()))
+
+
+_NEIGHBOR_OFFSETS = [
+    (-1, -1),
+    (-1, 0),
+    (-1, 1),
+    (0, -1),
+    (0, 1),
+    (1, -1),
+    (1, 0),
+    (1, 1),
+]
+
+
+def _sample_path_points(path: list[tuple[int, int]], path_length: int) -> tuple[np.ndarray, np.ndarray]:
+    coords = np.zeros((path_length, 2), dtype=np.int64)
+    mask = np.zeros((path_length,), dtype=np.float32)
+    if not path:
+        return coords, mask
+    if len(path) == 1:
+        coords[0] = np.asarray(path[0], dtype=np.int64)
+        mask[0] = 1.0
+        return coords, mask
+    sample_indices = np.linspace(0, len(path) - 1, path_length).round().astype(int)
+    sampled = np.asarray([path[index] for index in sample_indices], dtype=np.int64)
+    valid = min(len(sampled), path_length)
+    coords[:valid] = sampled[:valid]
+    mask[:valid] = 1.0
+    return coords, mask
+
+
+def _graph_nodes_from_targets(
+    skeleton: np.ndarray,
+    junction: np.ndarray,
+    endpoint: np.ndarray,
+) -> list[dict[str, Any]]:
+    skeleton_binary = skeleton > 0.5
+    node_mask = ((junction > 0.5) | (endpoint > 0.5)) & skeleton_binary
+    if not np.any(node_mask):
+        return []
+
+    structure = np.ones((3, 3), dtype=np.int8)
+    labels, num_labels = ndimage.label(node_mask.astype(np.uint8), structure=structure)
+    nodes: list[dict[str, Any]] = []
+    for label_index in range(1, int(num_labels) + 1):
+        coords = np.argwhere(labels == label_index)
+        if coords.size == 0:
+            continue
+        junction_votes = float(junction[labels == label_index].sum())
+        endpoint_votes = float(endpoint[labels == label_index].sum())
+        kind = "junction" if junction_votes >= endpoint_votes else "endpoint"
+        centroid = coords.mean(axis=0)
+        distances = np.linalg.norm(coords - centroid[None, :], axis=1)
+        point = coords[int(np.argmin(distances))]
+        nodes.append(
+            {
+                "index": len(nodes),
+                "kind": kind,
+                "point": (int(point[0]), int(point[1])),
+                "pixels": {tuple(map(int, coord)) for coord in coords.tolist()},
+            }
+        )
+    return nodes
+
+
+def _skeleton_neighbors(skeleton: np.ndarray, y: int, x: int) -> list[tuple[int, int]]:
+    height, width = skeleton.shape
+    neighbors: list[tuple[int, int]] = []
+    for dy, dx in _NEIGHBOR_OFFSETS:
+        ny = y + dy
+        nx = x + dx
+        if 0 <= ny < height and 0 <= nx < width and skeleton[ny, nx] > 0:
+            neighbors.append((ny, nx))
+    return neighbors
+
+
+def _trace_graph_edges(
+    skeleton: np.ndarray,
+    nodes: list[dict[str, Any]],
+) -> list[tuple[int, int, list[tuple[int, int]]]]:
+    if not nodes:
+        return []
+
+    node_lookup = -np.ones(skeleton.shape, dtype=np.int32)
+    for node in nodes:
+        for y, x in node["pixels"]:
+            node_lookup[y, x] = int(node["index"])
+
+    visited_segments: set[tuple[tuple[int, int], tuple[int, int]]] = set()
+    edge_paths: dict[tuple[int, int], list[tuple[int, int]]] = {}
+    skeleton_binary = (skeleton > 0.5).astype(np.uint8)
+
+    for node in nodes:
+        source_index = int(node["index"])
+        for y, x in node["pixels"]:
+            for neighbor in _skeleton_neighbors(skeleton_binary, y, x):
+                if node_lookup[neighbor] == source_index:
+                    continue
+                segment_key = tuple(sorted(((y, x), neighbor)))
+                if segment_key in visited_segments:
+                    continue
+
+                path = [(y, x), neighbor]
+                visited_segments.add(segment_key)
+                previous = (y, x)
+                current = neighbor
+
+                while True:
+                    current_node = int(node_lookup[current])
+                    if current_node >= 0 and current_node != source_index:
+                        pair = tuple(sorted((source_index, current_node)))
+                        if pair not in edge_paths or len(path) < len(edge_paths[pair]):
+                            edge_paths[pair] = path.copy()
+                        break
+
+                    next_candidates = [
+                        candidate
+                        for candidate in _skeleton_neighbors(skeleton_binary, current[0], current[1])
+                        if candidate != previous
+                    ]
+                    if not next_candidates:
+                        break
+
+                    if len(next_candidates) > 1:
+                        labeled_candidates = [candidate for candidate in next_candidates if node_lookup[candidate] >= 0]
+                        if len(labeled_candidates) == 1:
+                            next_point = labeled_candidates[0]
+                        else:
+                            unlabeled_candidates = [
+                                candidate
+                                for candidate in next_candidates
+                                if node_lookup[candidate] < 0
+                                and tuple(sorted((current, candidate))) not in visited_segments
+                            ]
+                            if len(unlabeled_candidates) != 1:
+                                break
+                            next_point = unlabeled_candidates[0]
+                    else:
+                        next_point = next_candidates[0]
+
+                    segment_key = tuple(sorted((current, next_point)))
+                    if segment_key in visited_segments and node_lookup[next_point] < 0:
+                        break
+                    visited_segments.add(segment_key)
+                    previous, current = current, next_point
+                    path.append(current)
+
+    traced_edges = [
+        (int(source), int(target), path)
+        for (source, target), path in sorted(edge_paths.items(), key=lambda item: item[0])
+    ]
+    return traced_edges
+
+
+def _build_graph_training_targets(
+    skeleton: np.ndarray,
+    junction: np.ndarray,
+    endpoint: np.ndarray,
+    max_pairs: int = 96,
+    path_length: int = 48,
+    max_pair_distance: float = 96.0,
+) -> dict[str, np.ndarray]:
+    nodes = _graph_nodes_from_targets(skeleton, junction, endpoint)
+    positive_edges = _trace_graph_edges(skeleton, nodes)
+
+    pair_points = np.zeros((max_pairs, 2, 2), dtype=np.int64)
+    pair_path_points = np.zeros((max_pairs, path_length, 2), dtype=np.int64)
+    pair_path_mask = np.zeros((max_pairs, path_length), dtype=np.float32)
+    pair_target = np.zeros((max_pairs,), dtype=np.float32)
+    pair_valid = np.zeros((max_pairs,), dtype=np.float32)
+
+    positive_lookup = {
+        tuple(sorted((source, target))): path for source, target, path in positive_edges
+    }
+
+    if not nodes:
+        return {
+            "graph_pair_points": pair_points,
+            "graph_pair_path_points": pair_path_points,
+            "graph_pair_path_mask": pair_path_mask,
+            "graph_target": pair_target,
+            "graph_pair_valid": pair_valid,
+        }
+
+    positive_pairs: list[tuple[tuple[int, int], list[tuple[int, int]]]] = list(positive_lookup.items())
+    negative_pairs: list[tuple[int, int, float]] = []
+    for left in range(len(nodes)):
+        for right in range(left + 1, len(nodes)):
+            pair = (left, right)
+            if pair in positive_lookup:
+                continue
+            point_left = np.asarray(nodes[left]["point"], dtype=np.float32)
+            point_right = np.asarray(nodes[right]["point"], dtype=np.float32)
+            distance = float(np.linalg.norm(point_left - point_right))
+            if distance <= max_pair_distance:
+                negative_pairs.append((left, right, distance))
+    negative_pairs.sort(key=lambda item: item[2])
+
+    max_positive = min(len(positive_pairs), max(max_pairs // 2, 1))
+    if len(positive_pairs) > max_positive > 0:
+        sample_indices = np.linspace(0, len(positive_pairs) - 1, max_positive).round().astype(int)
+        selected_positive = [positive_pairs[index] for index in sample_indices.tolist()]
+    else:
+        selected_positive = positive_pairs
+
+    pair_records: list[tuple[int, int, float, list[tuple[int, int]]]] = []
+    for (source, target), path in selected_positive:
+        pair_records.append((source, target, 1.0, path))
+
+    remaining = max_pairs - len(pair_records)
+    for source, target, _ in negative_pairs[: max(remaining, 0)]:
+        pair_records.append((source, target, 0.0, _line_points(nodes[source]["point"], nodes[target]["point"])))
+
+    for pair_index, (source, target, label, path) in enumerate(pair_records[:max_pairs]):
+        pair_points[pair_index, 0] = np.asarray(nodes[source]["point"], dtype=np.int64)
+        pair_points[pair_index, 1] = np.asarray(nodes[target]["point"], dtype=np.int64)
+        sampled_path, sampled_mask = _sample_path_points(path, path_length)
+        pair_path_points[pair_index] = sampled_path
+        pair_path_mask[pair_index] = sampled_mask
+        pair_target[pair_index] = float(label)
+        pair_valid[pair_index] = 1.0
+
+    return {
+        "graph_pair_points": pair_points,
+        "graph_pair_path_points": pair_path_points,
+        "graph_pair_path_mask": pair_path_mask,
+        "graph_target": pair_target,
+        "graph_pair_valid": pair_valid,
+    }
 
 
 class CalciumSummaryNpzDataset(Dataset):
@@ -68,7 +298,13 @@ class CalciumSummaryNpzDataset(Dataset):
             else:
                 uncertainty = np.zeros((1, image.shape[-2], image.shape[-1]), dtype=np.float32)
 
-        return {
+        graph_targets = _build_graph_training_targets(
+            skeleton=skeleton[0],
+            junction=junction[0],
+            endpoint=endpoint[0],
+        )
+
+        batch = {
             "image": torch.from_numpy(image),
             "mask": torch.from_numpy(mask),
             "skeleton": torch.from_numpy(skeleton),
@@ -77,6 +313,8 @@ class CalciumSummaryNpzDataset(Dataset):
             "affinity": torch.from_numpy(affinity),
             "uncertainty": torch.from_numpy(uncertainty),
         }
+        batch.update({key: torch.from_numpy(value) for key, value in graph_targets.items()})
+        return batch
 
 
 class SyntheticCalciumDataset(Dataset):
@@ -122,8 +360,13 @@ class SyntheticCalciumDataset(Dataset):
             junction,
             rng,
         )
+        graph_targets = _build_graph_training_targets(
+            skeleton=skeleton,
+            junction=junction,
+            endpoint=endpoint,
+        )
 
-        return {
+        batch = {
             "image": torch.from_numpy(image.astype(np.float32)),
             "mask": mask,
             "skeleton": skeleton_tensor,
@@ -132,6 +375,8 @@ class SyntheticCalciumDataset(Dataset):
             "affinity": torch.from_numpy(affinity.astype(np.float32)),
             "uncertainty": torch.from_numpy(uncertainty.astype(np.float32)),
         }
+        batch.update({key: torch.from_numpy(value) for key, value in graph_targets.items()})
+        return batch
 
     def _sample_tree(self, rng: np.random.Generator) -> np.ndarray:
         image = np.zeros((self.image_size, self.image_size), dtype=np.float32)

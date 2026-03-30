@@ -86,6 +86,7 @@ def build_model(config: dict[str, Any]) -> nn.Module:
         topology_variant=str(model_cfg.get("topology_variant", "none")),
         morphology_channels=tuple(model_cfg.get("morphology_channels", [0, 1])),
         activity_channels=tuple(model_cfg.get("activity_channels", [2, 3])),
+        graph_embedding_channels=int(model_cfg.get("graph_embedding_channels", 16)),
     )
 
 
@@ -193,6 +194,15 @@ def main() -> None:
 
     train_loader, val_loader = build_dataloaders(config)
     model = build_model(config).to(device)
+    init_checkpoint = str(config["training"].get("init_checkpoint", "")).strip()
+    if init_checkpoint:
+        checkpoint = torch.load(init_checkpoint, map_location=device)
+        state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        print(
+            f"Initialized model from {init_checkpoint} | "
+            f"missing={len(missing)} unexpected={len(unexpected)}"
+        )
     objective = TopoSparseObjective(config["loss"])
     optimizer = torch.optim.AdamW(
         model.parameters(),

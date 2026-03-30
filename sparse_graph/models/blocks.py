@@ -470,6 +470,144 @@ class BranchRelayReasoning(nn.Module):
         return dense_out, sparse_out, outputs
 
 
+class CounterfactualGeodesicReasoning(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        embedding_channels: int = 16,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.topology_encoder = nn.Sequential(
+            nn.Conv2d(8, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.prior_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.counterfactual_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.graph_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_update = ResidualBlock(channels * 2, channels)
+        self.sparse_update = ResidualBlock(channels * 2, channels)
+        self.graph_update = ResidualBlock(channels * 2, channels)
+        self.query_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, embedding_channels, kernel_size=1),
+        )
+        self.key_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, embedding_channels, kernel_size=1),
+        )
+        self.path_memory_head = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, 1, kernel_size=1),
+        )
+        self.counterfactual_gate_head = nn.Sequential(
+            nn.Conv2d(channels, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+
+    def forward(
+        self,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+        topology_logits: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        topology_probs = [torch.sigmoid(logits) for logits in topology_logits]
+        mask_prob, skeleton_prob, junction_prob, endpoint_prob, relay_prob, bridge_prob, counterfactual_prob = (
+            topology_probs
+        )
+        node_support = torch.maximum(junction_prob, endpoint_prob)
+        geodesic_prior = torch.clamp(
+            0.35 * mask_prob
+            + 0.45 * skeleton_prob
+            + 0.35 * relay_prob
+            + 0.30 * bridge_prob
+            + 0.20 * counterfactual_prob
+            + 0.15 * node_support,
+            0.0,
+            1.0,
+        )
+        counterfactual_gap = torch.clamp(counterfactual_prob - skeleton_prob, min=0.0, max=1.0)
+        topology_state = self.topology_encoder(
+            torch.cat(
+                [
+                    mask_prob,
+                    skeleton_prob,
+                    junction_prob,
+                    endpoint_prob,
+                    relay_prob,
+                    bridge_prob,
+                    counterfactual_prob,
+                    counterfactual_gap,
+                ],
+                dim=1,
+            )
+        )
+        prior_features = self.prior_to_features(geodesic_prior)
+        counterfactual_features = self.counterfactual_to_features(counterfactual_gap)
+        graph_gate = self.graph_gate(
+            torch.cat(
+                [
+                    dense_features,
+                    sparse_features,
+                    topology_state,
+                    prior_features + counterfactual_features,
+                ],
+                dim=1,
+            )
+        )
+
+        shared_dense = topology_state + prior_features - 0.25 * counterfactual_features
+        shared_sparse = topology_state + prior_features + 0.35 * counterfactual_features
+        dense_out = self.dense_update(
+            torch.cat([dense_features * (1.0 + graph_gate), shared_dense], dim=1)
+        )
+        sparse_out = self.sparse_update(
+            torch.cat(
+                [sparse_features * (1.0 + graph_gate) * (1.0 + geodesic_prior), shared_sparse],
+                dim=1,
+            )
+        )
+        graph_features = self.graph_update(
+            torch.cat([0.5 * (dense_out + sparse_out), topology_state + prior_features], dim=1)
+        )
+        outputs = {
+            "graph_query_embeddings": self.query_head(graph_features),
+            "graph_key_embeddings": self.key_head(graph_features),
+            "path_memory_logits": self.path_memory_head(graph_features),
+            "counterfactual_gate_logits": self.counterfactual_gate_head(
+                graph_features + counterfactual_features
+            ),
+        }
+        return dense_out, sparse_out, outputs
+
+
 class BioCausalRouting(nn.Module):
     def __init__(
         self,

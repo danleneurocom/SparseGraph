@@ -14,6 +14,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from sparse_graph.calibration import (
+    apply_temperature_scaling,
+    load_calibration,
+    resolve_postprocess_config,
+)
 from sparse_graph.graph.builder import GraphBuilder
 from sparse_graph.models import TopoSparseNet
 
@@ -38,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         help="Time axis for raw movies. Default assumes [T, H, W].",
     )
     parser.add_argument("--device", default=None, help="Override checkpoint device, e.g. cpu or mps.")
+    parser.add_argument(
+        "--calibration-json",
+        default=None,
+        help="Optional temperature/threshold calibration file.",
+    )
     parser.add_argument(
         "--tta",
         choices=("none", "flips"),
@@ -180,6 +190,7 @@ def build_model_from_checkpoint(checkpoint: dict[str, Any]) -> tuple[TopoSparseN
         topology_variant=str(model_cfg.get("topology_variant", "none")),
         morphology_channels=tuple(model_cfg.get("morphology_channels", [0, 1])),
         activity_channels=tuple(model_cfg.get("activity_channels", [2, 3])),
+        graph_embedding_channels=int(model_cfg.get("graph_embedding_channels", 16)),
     )
     model.load_state_dict(checkpoint["model"])
     return model, config
@@ -230,6 +241,7 @@ def graph_to_json(graph_result: dict[str, Any]) -> dict[str, Any]:
                 "source": int(edge.source),
                 "target": int(edge.target),
                 "score": float(edge.score),
+                "path": [[int(y), int(x)] for y, x in edge.path],
             }
             for edge in graph_result["edges"]
         ],
@@ -244,6 +256,7 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu")
     model, config = build_model_from_checkpoint(checkpoint)
+    calibration = load_calibration(args.calibration_json)
     device = resolve_device(args.device or config.get("device"))
     model = model.to(device)
     model.eval()
@@ -257,9 +270,12 @@ def main() -> None:
 
     image_size = int(config["data"]["image_size"])
     image = resize_summary(summary, image_size=image_size)
-    predictions = predict_with_tta(model, image, device=device, tta=args.tta)
+    predictions = apply_temperature_scaling(
+        predict_with_tta(model, image, device=device, tta=args.tta),
+        calibration,
+    )
 
-    post_cfg = dict(config.get("postprocess", {}))
+    post_cfg = resolve_postprocess_config(config, calibration)
     overrides = {
         "node_threshold": args.node_threshold,
         "skeleton_threshold": args.skeleton_threshold,
@@ -313,6 +329,7 @@ def main() -> None:
     metadata = {
         "input_path": str(input_path),
         "checkpoint": str(args.checkpoint),
+        "calibration": str(args.calibration_json) if args.calibration_json else None,
         "device": str(device),
         "input_mode": input_mode,
         "tta": args.tta,
