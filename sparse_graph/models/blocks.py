@@ -77,6 +77,550 @@ class SqueezeExcitation(nn.Module):
         return x * self.block(x)
 
 
+class TopologyAwareRefinement(nn.Module):
+    def __init__(
+        self,
+        feature_channels: int,
+        topology_channels: int = 4,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        hidden = max(feature_channels // reduction, 8)
+        self.topology_encoder = nn.Sequential(
+            nn.Conv2d(topology_channels, feature_channels, kernel_size=3, padding=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+            nn.Conv2d(feature_channels, feature_channels, kernel_size=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+        )
+        self.spatial_gate = nn.Sequential(
+            nn.Conv2d(feature_channels * 2, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.channel_gate = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(feature_channels * 2, hidden, kernel_size=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden, feature_channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.mix = ResidualBlock(feature_channels * 2, feature_channels)
+
+    def forward(self, features: torch.Tensor, topology_logits: list[torch.Tensor]) -> torch.Tensor:
+        topology_prior = torch.cat([torch.sigmoid(logits) for logits in topology_logits], dim=1)
+        topology_features = self.topology_encoder(topology_prior)
+        joint = torch.cat([features, topology_features], dim=1)
+        spatial = self.spatial_gate(joint)
+        channel = self.channel_gate(joint)
+        gated = features * (1.0 + spatial) * (1.0 + channel)
+        return self.mix(torch.cat([gated, topology_features], dim=1))
+
+
+class DenseSparseCoupling(nn.Module):
+    def __init__(self, channels: int, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.dense_gate = nn.Sequential(
+            nn.Conv2d(channels * 2, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.sparse_gate = nn.Sequential(
+            nn.Conv2d(channels * 2, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_mix = ResidualBlock(channels * 2, channels)
+        self.sparse_mix = ResidualBlock(channels * 2, channels)
+
+    def forward(self, dense_features: torch.Tensor, sparse_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        joint = torch.cat([dense_features, sparse_features], dim=1)
+        dense_gate = self.dense_gate(joint)
+        sparse_gate = self.sparse_gate(joint)
+        dense_out = self.dense_mix(
+            torch.cat([dense_features * (1.0 + dense_gate), sparse_features], dim=1)
+        )
+        sparse_out = self.sparse_mix(
+            torch.cat([sparse_features * (1.0 + sparse_gate), dense_features], dim=1)
+        )
+        return dense_out, sparse_out
+
+
+class TopologyConsensusRollout(nn.Module):
+    def __init__(self, channels: int, topology_channels: int = 4, reduction: int = 4) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.topology_encoder = nn.Sequential(
+            nn.Conv2d(topology_channels + 2, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.consensus_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.conflict_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.dense_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.sparse_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_update = ResidualBlock(channels * 2, channels)
+        self.sparse_update = ResidualBlock(channels * 2, channels)
+
+    def forward(
+        self,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+        topology_logits: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        topology_probs = [torch.sigmoid(logits) for logits in topology_logits]
+        mask_prob, skeleton_prob, junction_prob, endpoint_prob = topology_probs
+        consensus = torch.sqrt(mask_prob.clamp_min(1e-6) * skeleton_prob.clamp_min(1e-6))
+        consensus = consensus * (1.0 + torch.maximum(junction_prob, endpoint_prob))
+        conflict = torch.abs(mask_prob - skeleton_prob) + torch.relu(
+            torch.maximum(junction_prob, endpoint_prob) - skeleton_prob
+        )
+        topology_state = self.topology_encoder(torch.cat(topology_probs + [consensus, conflict], dim=1))
+        consensus_features = self.consensus_to_features(consensus)
+        conflict_features = self.conflict_to_features(conflict)
+
+        dense_gate = self.dense_gate(
+            torch.cat(
+                [dense_features, sparse_features, topology_state, consensus_features],
+                dim=1,
+            )
+        )
+        sparse_gate = self.sparse_gate(
+            torch.cat(
+                [sparse_features, dense_features, topology_state, conflict_features],
+                dim=1,
+            )
+        )
+
+        shared_dense = topology_state + consensus_features - 0.5 * conflict_features
+        shared_sparse = topology_state + consensus_features - conflict_features
+        dense_out = self.dense_update(
+            torch.cat([dense_features * (1.0 + dense_gate), shared_dense], dim=1)
+        )
+        sparse_out = self.sparse_update(
+            torch.cat([sparse_features * (1.0 + sparse_gate), shared_sparse], dim=1)
+        )
+        return dense_out, sparse_out
+
+
+class BranchRelayReasoning(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        affinity_channels: int = 2,
+        relay_kernel_sizes: tuple[int, ...] = (5, 9, 13),
+        counterfactual_drop_prob: float = 0.3,
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        hidden = max(channels // reduction, 8)
+        self.relay_kernel_sizes = tuple(relay_kernel_sizes)
+        self.counterfactual_drop_prob = float(counterfactual_drop_prob)
+        self.topology_encoder = nn.Sequential(
+            nn.Conv2d(8, channels, kernel_size=3, padding=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+            nn.Conv2d(channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.affinity_encoder = nn.Sequential(
+            nn.Conv2d(affinity_channels, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.endpoint_relay_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.junction_relay_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.bridge_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.counterfactual_to_features = nn.Sequential(
+            nn.Conv2d(1, channels, kernel_size=1, bias=False),
+            make_norm(channels),
+            nn.SiLU(),
+        )
+        self.dense_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.sparse_gate = nn.Sequential(
+            nn.Conv2d(channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_update = ResidualBlock(channels * 2, channels)
+        self.sparse_update = ResidualBlock(channels * 2, channels)
+        for kernel_size in self.relay_kernel_sizes:
+            self.register_buffer(
+                f"line_kernels_{kernel_size}",
+                self._make_line_kernels(kernel_size),
+                persistent=False,
+            )
+
+    @staticmethod
+    def _make_line_kernels(kernel_size: int) -> torch.Tensor:
+        if kernel_size % 2 == 0:
+            raise ValueError("relay_kernel_size must be odd.")
+        kernels = torch.zeros((4, 1, kernel_size, kernel_size), dtype=torch.float32)
+        center = kernel_size // 2
+        kernels[0, 0, center, :] = 1.0
+        kernels[1, 0, :, center] = 1.0
+        for index in range(kernel_size):
+            kernels[2, 0, index, index] = 1.0
+            kernels[3, 0, index, kernel_size - 1 - index] = 1.0
+        kernels = kernels / kernels.sum(dim=(2, 3), keepdim=True).clamp_min(1.0)
+        return kernels
+
+    def _propagate_with_orientation(
+        self,
+        seed_map: torch.Tensor,
+        orientation_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        responses: list[torch.Tensor] = []
+        for kernel_size in self.relay_kernel_sizes:
+            line_kernels = getattr(self, f"line_kernels_{kernel_size}")
+            line_response = F.conv2d(
+                seed_map,
+                line_kernels.to(device=seed_map.device, dtype=seed_map.dtype),
+                padding=kernel_size // 2,
+            )
+            responses.append((orientation_weights * line_response).sum(dim=1, keepdim=True))
+        return torch.stack(responses, dim=0).mean(dim=0)
+
+    def forward(
+        self,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+        topology_logits: list[torch.Tensor],
+        affinity_logits: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        mask_prob, skeleton_prob, junction_prob, endpoint_prob = [
+            torch.sigmoid(logits) for logits in topology_logits
+        ]
+        node_seed = torch.maximum(junction_prob, endpoint_prob)
+        affinity = torch.tanh(affinity_logits)
+
+        norm = torch.sqrt((affinity**2).sum(dim=1, keepdim=True) + 1e-6)
+        dir_x = affinity[:, 0:1] / norm
+        dir_y = affinity[:, 1:2] / norm
+        inv_sqrt_two = 0.7071067811865476
+        orientation_logits = torch.cat(
+            [
+                dir_x.abs(),
+                dir_y.abs(),
+                ((dir_x + dir_y) * inv_sqrt_two).abs(),
+                ((dir_x - dir_y) * inv_sqrt_two).abs(),
+            ],
+            dim=1,
+        )
+        orientation_weights = orientation_logits / orientation_logits.sum(dim=1, keepdim=True).clamp_min(1e-6)
+
+        endpoint_relay = self._propagate_with_orientation(endpoint_prob, orientation_weights)
+        junction_relay = self._propagate_with_orientation(junction_prob, orientation_weights)
+        node_context = F.max_pool2d(node_seed, kernel_size=3, stride=1, padding=1)
+        relay_map = torch.clamp(
+            0.45 * endpoint_relay
+            + 0.35 * junction_relay
+            + 0.35 * skeleton_prob
+            + 0.2 * node_context,
+            0.0,
+            1.0,
+        )
+
+        max_kernel = max(self.relay_kernel_sizes)
+        bridge_seed = F.max_pool2d(
+            node_seed,
+            kernel_size=max_kernel,
+            stride=1,
+            padding=max_kernel // 2,
+        )
+        bridge_map = torch.clamp(
+            mask_prob * (1.0 - skeleton_prob) * (0.6 * relay_map + 0.4 * bridge_seed),
+            0.0,
+            1.0,
+        )
+
+        if self.training and self.counterfactual_drop_prob > 0:
+            drop_focus = (relay_map > relay_map.mean(dim=(2, 3), keepdim=True)).float()
+            drop_mask = (torch.rand_like(relay_map) < self.counterfactual_drop_prob).float() * drop_focus
+        else:
+            drop_mask = torch.zeros_like(relay_map)
+        counterfactual_skeleton = skeleton_prob * (1.0 - drop_mask)
+        counterfactual_bridge = torch.clamp(
+            mask_prob
+            * (1.0 - counterfactual_skeleton)
+            * (0.55 * endpoint_relay + 0.3 * junction_relay + 0.35 * node_context),
+            0.0,
+            1.0,
+        )
+        bridge_consensus = torch.maximum(bridge_map, counterfactual_bridge)
+        relay_conflict = torch.abs(endpoint_relay - junction_relay)
+
+        topology_state = self.topology_encoder(
+            torch.cat(
+                [
+                    mask_prob,
+                    skeleton_prob,
+                    node_seed,
+                    endpoint_relay,
+                    junction_relay,
+                    bridge_consensus,
+                    counterfactual_bridge,
+                    relay_conflict,
+                ],
+                dim=1,
+            )
+        )
+        affinity_features = self.affinity_encoder(affinity)
+        endpoint_relay_features = self.endpoint_relay_to_features(endpoint_relay)
+        junction_relay_features = self.junction_relay_to_features(junction_relay)
+        bridge_features = self.bridge_to_features(bridge_consensus)
+        counterfactual_features = self.counterfactual_to_features(counterfactual_bridge)
+
+        dense_gate = self.dense_gate(
+            torch.cat(
+                [
+                    dense_features,
+                    sparse_features,
+                    topology_state,
+                    bridge_features + counterfactual_features,
+                ],
+                dim=1,
+            )
+        )
+        sparse_context = endpoint_relay_features + junction_relay_features + affinity_features + counterfactual_features
+        sparse_gate = self.sparse_gate(
+            torch.cat([sparse_features, dense_features, topology_state, sparse_context], dim=1)
+        )
+
+        dense_out = self.dense_update(
+            torch.cat(
+                [
+                    dense_features * (1.0 + dense_gate),
+                    topology_state + bridge_features + counterfactual_features,
+                ],
+                dim=1,
+            )
+        )
+        sparse_out = self.sparse_update(
+            torch.cat(
+                [
+                    sparse_features * (1.0 + sparse_gate) * (1.0 + relay_map),
+                    topology_state + sparse_context,
+                ],
+                dim=1,
+            )
+        )
+
+        outputs = {
+            "relay_logits": torch.logit(relay_map.clamp(1e-4, 1.0 - 1e-4)),
+            "bridge_logits": torch.logit(bridge_consensus.clamp(1e-4, 1.0 - 1e-4)),
+            "counterfactual_bridge_logits": torch.logit(
+                counterfactual_bridge.clamp(1e-4, 1.0 - 1e-4)
+            ),
+            "endpoint_relay_logits": torch.logit(endpoint_relay.clamp(1e-4, 1.0 - 1e-4)),
+            "junction_relay_logits": torch.logit(junction_relay.clamp(1e-4, 1.0 - 1e-4)),
+        }
+        return dense_out, sparse_out, outputs
+
+
+class BioCausalRouting(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        feature_channels: int,
+        morphology_channels: tuple[int, ...] = (0, 1),
+        activity_channels: tuple[int, ...] = (2, 3),
+        reduction: int = 4,
+    ) -> None:
+        super().__init__()
+        if not morphology_channels or not activity_channels:
+            raise ValueError("BioCausalRouting requires non-empty morphology and activity channel groups.")
+
+        self.morphology_channels = tuple(morphology_channels)
+        self.activity_channels = tuple(activity_channels)
+        hidden = max(feature_channels // reduction, 8)
+
+        self.morphology_prior = nn.Sequential(
+            nn.Conv2d(len(self.morphology_channels), hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.activity_prior = nn.Sequential(
+            nn.Conv2d(len(self.activity_channels), hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.agreement_head = nn.Sequential(
+            nn.Conv2d(3, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+        self.conflict_head = nn.Sequential(
+            nn.Conv2d(4, hidden, kernel_size=3, padding=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 1, kernel_size=1),
+        )
+
+        self.morphology_to_features = nn.Sequential(
+            nn.Conv2d(1, feature_channels, kernel_size=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+        )
+        self.activity_to_features = nn.Sequential(
+            nn.Conv2d(1, feature_channels, kernel_size=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+        )
+        self.agreement_to_features = nn.Sequential(
+            nn.Conv2d(1, feature_channels, kernel_size=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+        )
+        self.conflict_to_features = nn.Sequential(
+            nn.Conv2d(1, feature_channels, kernel_size=1, bias=False),
+            make_norm(feature_channels),
+            nn.SiLU(),
+        )
+
+        self.dense_gate = nn.Sequential(
+            nn.Conv2d(feature_channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, feature_channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.sparse_gate = nn.Sequential(
+            nn.Conv2d(feature_channels * 4, hidden, kernel_size=1, bias=False),
+            make_norm(hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, feature_channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+        self.dense_mix = ResidualBlock(feature_channels * 2, feature_channels)
+        self.sparse_mix = ResidualBlock(feature_channels * 2, feature_channels)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        dense_features: torch.Tensor,
+        sparse_features: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+        morphology_input = x[:, self.morphology_channels, ...]
+        activity_input = x[:, self.activity_channels, ...]
+
+        morphology_prior_logits = self.morphology_prior(morphology_input)
+        activity_prior_logits = self.activity_prior(activity_input)
+        morphology_prior = torch.sigmoid(morphology_prior_logits)
+        activity_prior = torch.sigmoid(activity_prior_logits)
+
+        agreement_logits = self.agreement_head(
+            torch.cat(
+                [
+                    morphology_prior,
+                    activity_prior,
+                    morphology_prior * activity_prior,
+                ],
+                dim=1,
+            )
+        )
+        conflict_logits = self.conflict_head(
+            torch.cat(
+                [
+                    torch.abs(morphology_prior - activity_prior),
+                    morphology_prior * (1.0 - activity_prior),
+                    activity_prior * (1.0 - morphology_prior),
+                    torch.maximum(morphology_prior, activity_prior),
+                ],
+                dim=1,
+            )
+        )
+        agreement = torch.sigmoid(agreement_logits)
+        conflict = torch.sigmoid(conflict_logits)
+
+        morphology_features = self.morphology_to_features(morphology_prior)
+        activity_features = self.activity_to_features(activity_prior)
+        agreement_features = self.agreement_to_features(agreement)
+        conflict_features = self.conflict_to_features(conflict)
+
+        dense_gate = self.dense_gate(
+            torch.cat(
+                [dense_features, morphology_features, agreement_features, conflict_features],
+                dim=1,
+            )
+        )
+        sparse_gate = self.sparse_gate(
+            torch.cat(
+                [sparse_features, activity_features, agreement_features, conflict_features],
+                dim=1,
+            )
+        )
+
+        dense_conditioned = dense_features * (1.0 + dense_gate) * (1.0 + agreement)
+        sparse_conditioned = sparse_features * (1.0 + sparse_gate) * (1.0 + agreement) * (1.0 - 0.5 * conflict)
+
+        dense_out = self.dense_mix(torch.cat([dense_conditioned, morphology_features], dim=1))
+        sparse_out = self.sparse_mix(torch.cat([sparse_conditioned, activity_features], dim=1))
+
+        priors = {
+            "morphology_prior_logits": morphology_prior_logits,
+            "activity_prior_logits": activity_prior_logits,
+            "agreement_logits": agreement_logits,
+            "conflict_logits": conflict_logits,
+        }
+        return dense_out, sparse_out, priors
+
+
 class DownBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()

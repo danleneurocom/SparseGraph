@@ -13,6 +13,7 @@ from tqdm import tqdm
 from .config import load_config
 from .data import CalciumSummaryNpzDataset, SyntheticCalciumDataset
 from .losses import TopoSparseObjective
+from .metrics import publication_metrics
 from .models import TopoSparseNet
 from .utils import MetricTracker, move_batch_to_device, set_seed, to_float_dict
 
@@ -81,6 +82,10 @@ def build_model(config: dict[str, Any]) -> nn.Module:
         channel_multipliers=tuple(model_cfg["channel_multipliers"]),
         use_attention=bool(model_cfg["use_attention"]),
         affinity_channels=int(model_cfg["affinity_channels"]),
+        use_topology_refinement=bool(model_cfg.get("use_topology_refinement", False)),
+        topology_variant=str(model_cfg.get("topology_variant", "none")),
+        morphology_channels=tuple(model_cfg.get("morphology_channels", [0, 1])),
+        activity_channels=tuple(model_cfg.get("activity_channels", [2, 3])),
     )
 
 
@@ -94,6 +99,7 @@ def run_epoch(
     epoch: int,
     split: str,
     log_every: int,
+    include_publication_metrics: bool = False,
 ) -> dict[str, float]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -105,6 +111,14 @@ def run_epoch(
         with torch.set_grad_enabled(is_train):
             predictions = model(batch["image"])
             loss, metrics = objective(predictions, batch)
+            if include_publication_metrics:
+                metrics.update(
+                    publication_metrics(
+                        predictions,
+                        batch,
+                        skeleton_iterations=int(objective.weights.get("skeleton_iterations", 10)),
+                    )
+                )
 
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
@@ -123,6 +137,7 @@ def run_epoch(
                 loss=f"{avg['loss']:.4f}",
                 mask_dice=f"{avg['mask_dice']:.4f}",
                 skeleton_dice=f"{avg['skeleton_dice']:.4f}",
+                cldice=f"{avg.get('cldice', 0.0):.4f}",
             )
 
     return tracker.averages()
@@ -197,6 +212,7 @@ def main() -> None:
             epoch=epoch,
             split="train",
             log_every=int(config["training"]["log_every"]),
+            include_publication_metrics=False,
         )
         val_metrics = run_epoch(
             model=model,
@@ -208,11 +224,13 @@ def main() -> None:
             epoch=epoch,
             split="val",
             log_every=int(config["training"]["log_every"]),
+            include_publication_metrics=True,
         )
 
-        is_best = val_metrics["mask_dice"] > best_val
+        selection_metric = float(val_metrics.get("publish_score", val_metrics.get("selection_score", 0.0)))
+        is_best = selection_metric > best_val
         if is_best:
-            best_val = val_metrics["mask_dice"]
+            best_val = selection_metric
         save_checkpoint(output_dir, epoch, model, optimizer, config, val_metrics, is_best=is_best)
 
         print(
@@ -220,5 +238,7 @@ def main() -> None:
             f"train loss {train_metrics['loss']:.4f} | "
             f"val loss {val_metrics['loss']:.4f} | "
             f"val mask dice {val_metrics['mask_dice']:.4f} | "
-            f"val skeleton dice {val_metrics['skeleton_dice']:.4f}"
+            f"val skeleton dice {val_metrics['skeleton_dice']:.4f} | "
+            f"val cldice {val_metrics.get('cldice', 0.0):.4f} | "
+            f"val publish score {val_metrics.get('publish_score', selection_metric):.4f}"
         )

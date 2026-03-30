@@ -1,0 +1,50 @@
+{
+  "seed": 7,
+  "device": "mps",
+  "output_dir": "runs/toposparsenet_ixi_dualroute_mps",
+  "model": {
+    "in_channels": 4,
+    "base_channels": 32,
+    "channel_multipliers": [1, 2, 4, 8],
+    "use_attention": true,
+    "affinity_channels": 2,
+    "use_topology_refinement": true,
+    "topology_variant": "dual_branch"
+  },
+  "data": {
+    "dataset_type": "npz",
+    "train_dir": "data/ixi_npz/train",
+    "val_dir": "data/ixi_npz/val",
+    "image_size": 256,
+    "train_samples": 0,
+    "val_samples": 0,
+    "batch_size": 4,
+    "num_workers": 0
+  },
+  "training": {
+    "epochs": 5,
+    "lr": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "log_every": 10
+  },
+  "loss": {
+    "mask": 1.0,
+    "skeleton": 1.0,
+    "topology": 0.5,
+    "node": 0.5,
+    "affinity": 0.25,
+    "uncertainty": 0.05,
+    "auxiliary": 0.15,
+    "consistency": 0.1,
+    "graph": 0.0,
+    "skeleton_iterations": 10
+  },
+  "postprocess": {
+    "node_threshold": 0.5,
+    "skeleton_threshold": 0.5,
+    "max_neighbor_distance": 24,
+    "min_path_support": 0.35,
+    "max_neighbors_per_node": 2
+  }
+}

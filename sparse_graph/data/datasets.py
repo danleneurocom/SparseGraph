@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -27,9 +28,23 @@ def _line_points(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int
 class CalciumSummaryNpzDataset(Dataset):
     def __init__(self, root: str) -> None:
         self.root = Path(root)
-        self.files = sorted(self.root.glob("*.npz"))
+        candidate_files = sorted(self.root.glob("*.npz"))
+        required_keys = {"image", "mask", "skeleton", "junction", "endpoint"}
+        self.files: list[Path] = []
+        skipped_files: list[Path] = []
+        for path in candidate_files:
+            try:
+                with np.load(path) as sample:
+                    if required_keys.issubset(sample.files):
+                        self.files.append(path)
+                    else:
+                        skipped_files.append(path)
+            except (OSError, ValueError, EOFError, zipfile.BadZipFile):
+                skipped_files.append(path)
         if not self.files:
             raise FileNotFoundError(f"No .npz files found in {self.root}")
+        if skipped_files:
+            print(f"Skipping {len(skipped_files)} unreadable samples from {self.root}")
 
     def __len__(self) -> int:
         return len(self.files)
