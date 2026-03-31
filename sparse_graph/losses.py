@@ -335,6 +335,7 @@ class TopoSparseObjective(nn.Module):
         relay_loss = predictions["mask_logits"].new_tensor(0.0)
         node_policy_loss = predictions["mask_logits"].new_tensor(0.0)
         graph_importance_loss = predictions["mask_logits"].new_tensor(0.0)
+        graph_minimal_loss = predictions["mask_logits"].new_tensor(0.0)
         branch_budget_loss = predictions["mask_logits"].new_tensor(0.0)
         branch_austerity_loss = predictions["mask_logits"].new_tensor(0.0)
 
@@ -412,6 +413,34 @@ class TopoSparseObjective(nn.Module):
                 * branch_prune_probs
                 * (1.0 - F.max_pool2d(batch["skeleton"], kernel_size=3, stride=1, padding=1))
             ).mean()
+            if "graph_backbone_path" in batch and "graph_redundant_path" in batch:
+                backbone_target = batch["graph_backbone_path"].float()
+                redundant_target = batch["graph_redundant_path"].float()
+                protected_backbone = torch.clamp(
+                    F.max_pool2d(backbone_target, kernel_size=7, stride=1, padding=3)
+                    + F.max_pool2d(node_context, kernel_size=3, stride=1, padding=1),
+                    0.0,
+                    1.0,
+                )
+                strict_redundant = torch.clamp(redundant_target * (1.0 - protected_backbone), 0.0, 1.0)
+                branch_austerity_loss = branch_austerity_loss + 0.45 * dice_loss_from_probs(
+                    branch_keep_probs,
+                    torch.clamp(backbone_target + 0.25 * keep_target, 0.0, 1.0),
+                )
+                branch_austerity_loss = branch_austerity_loss + 0.75 * dice_loss_from_probs(
+                    branch_prune_probs,
+                    strict_redundant,
+                )
+                branch_austerity_loss = branch_austerity_loss + 0.45 * binary_focal_loss_with_logits(
+                    predictions["branch_prune_logits"],
+                    strict_redundant,
+                )
+                branch_austerity_loss = branch_austerity_loss + 0.20 * (
+                    branch_keep_probs * strict_redundant
+                ).mean()
+                branch_austerity_loss = branch_austerity_loss + 0.10 * (
+                    torch.clamp(skeleton_probs - batch["skeleton"], 0.0, 1.0) * strict_redundant
+                ).mean()
 
         auxiliary_loss = predictions["mask_logits"].new_tensor(0.0)
         if "coarse_mask_logits" in predictions:
@@ -535,6 +564,32 @@ class TopoSparseObjective(nn.Module):
                 dense_sparse_projection_probs
                 * (1.0 - F.max_pool2d(mask_probs, kernel_size=3, stride=1, padding=1))
             ).mean()
+            if "graph_backbone_path" in batch and "graph_redundant_path" in batch:
+                backbone_target = batch["graph_backbone_path"].float()
+                redundant_target = batch["graph_redundant_path"].float()
+                node_buffer = F.max_pool2d(
+                    torch.maximum(batch["junction"], batch["endpoint"]),
+                    kernel_size=7,
+                    stride=1,
+                    padding=3,
+                )
+                strict_redundant = torch.clamp(
+                    redundant_target
+                    * (1.0 - F.max_pool2d(backbone_target, kernel_size=7, stride=1, padding=3))
+                    * (1.0 - node_buffer),
+                    0.0,
+                    1.0,
+                )
+                branch_austerity_loss = branch_austerity_loss + 0.35 * dice_loss_from_probs(
+                    dense_sparse_projection_probs,
+                    torch.clamp(projection_target + 0.35 * backbone_target, 0.0, 1.0),
+                )
+                branch_austerity_loss = branch_austerity_loss + 0.30 * (
+                    dense_sparse_projection_probs * strict_redundant
+                ).mean()
+                consistency_loss = consistency_loss + 0.10 * (
+                    dense_sparse_projection_probs.detach() * strict_redundant
+                ).mean()
 
         if (
             "morphology_prior_logits" in predictions
@@ -600,12 +655,46 @@ class TopoSparseObjective(nn.Module):
                 ).sum() / graph_weight.sum().clamp_min(1.0)
             else:
                 pair_importance_mae = predictions["mask_logits"].new_tensor(0.0)
+            if "graph_minimal_target" in batch and "graph_minimal_valid" in batch:
+                minimal_target = batch["graph_minimal_target"].float()
+                minimal_valid = batch["graph_minimal_valid"].float() * graph_weight
+                minimal_loss_map = F.binary_cross_entropy_with_logits(
+                    graph_logits,
+                    minimal_target,
+                    reduction="none",
+                )
+                graph_minimal_loss = (minimal_loss_map * minimal_valid).sum() / minimal_valid.sum().clamp_min(
+                    1.0
+                )
+                redundant_mask = minimal_valid * (1.0 - minimal_target)
+                if redundant_mask.sum() > 0:
+                    if "graph_pair_importance" in batch:
+                        redundant_weight = redundant_mask * (
+                            0.35 + 0.65 * (1.0 - batch["graph_pair_importance"].float())
+                        )
+                    else:
+                        redundant_weight = redundant_mask
+                    graph_minimal_loss = graph_minimal_loss + 0.25 * (
+                        (graph_probs * redundant_weight).sum() / redundant_weight.sum().clamp_min(1.0)
+                    )
+                essential_mask = minimal_valid * minimal_target
+                graph_essential_recall = ((graph_pred * essential_mask).sum()) / essential_mask.sum().clamp_min(
+                    1.0
+                )
+                graph_surplus_prob = (graph_probs * redundant_mask).sum() / redundant_mask.sum().clamp_min(
+                    1.0
+                )
+            else:
+                graph_essential_recall = predictions["mask_logits"].new_tensor(0.0)
+                graph_surplus_prob = predictions["mask_logits"].new_tensor(0.0)
             predictions["graph_logits"] = graph_logits.detach()
         else:
             graph_loss = predictions["mask_logits"].new_tensor(0.0)
             graph_accuracy = predictions["mask_logits"].new_tensor(0.0)
             graph_recall = predictions["mask_logits"].new_tensor(0.0)
             pair_importance_mae = predictions["mask_logits"].new_tensor(0.0)
+            graph_essential_recall = predictions["mask_logits"].new_tensor(0.0)
+            graph_surplus_prob = predictions["mask_logits"].new_tensor(0.0)
 
         total = (
             self.weights.get("mask", 1.0) * mask_loss
@@ -625,6 +714,7 @@ class TopoSparseObjective(nn.Module):
             + self.weights.get("branch_budget", 0.0) * branch_budget_loss
             + self.weights.get("branch_austerity", 0.0) * branch_austerity_loss
             + self.weights.get("graph_importance", 0.0) * graph_importance_loss
+            + self.weights.get("graph_minimal", 0.0) * graph_minimal_loss
             + self.weights.get("graph", 0.0) * graph_loss
         )
 
@@ -648,8 +738,11 @@ class TopoSparseObjective(nn.Module):
             "branch_austerity_loss": branch_austerity_loss,
             "graph_loss": graph_loss,
             "graph_importance_loss": graph_importance_loss,
+            "graph_minimal_loss": graph_minimal_loss,
             "graph_accuracy": graph_accuracy,
             "graph_recall": graph_recall,
+            "graph_essential_recall": graph_essential_recall,
+            "graph_surplus_prob": graph_surplus_prob,
             "pair_importance_mae": pair_importance_mae,
             "mask_dice": binary_dice_score_from_logits(predictions["mask_logits"], batch["mask"]),
             "skeleton_dice": binary_dice_score_from_logits(

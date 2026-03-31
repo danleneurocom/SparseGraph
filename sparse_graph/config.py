@@ -58,6 +58,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "branch_budget": 0.0,
         "branch_austerity": 0.0,
         "graph_importance": 0.0,
+        "graph_minimal": 0.0,
         "graph": 0.0,
         "skeleton_iterations": 10,
     },

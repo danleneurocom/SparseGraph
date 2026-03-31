@@ -55,6 +55,38 @@ def _sample_path_points(path: list[tuple[int, int]], path_length: int) -> tuple[
     return coords, mask
 
 
+def _maximum_spanning_edge_subset(
+    num_nodes: int,
+    weighted_edges: list[tuple[int, int, float]],
+) -> set[tuple[int, int]]:
+    parent = list(range(max(num_nodes, 0)))
+    rank = [0 for _ in range(max(num_nodes, 0))]
+
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    def union(left: int, right: int) -> bool:
+        root_left = find(left)
+        root_right = find(right)
+        if root_left == root_right:
+            return False
+        if rank[root_left] < rank[root_right]:
+            root_left, root_right = root_right, root_left
+        parent[root_right] = root_left
+        if rank[root_left] == rank[root_right]:
+            rank[root_left] += 1
+        return True
+
+    selected: set[tuple[int, int]] = set()
+    for source, target, weight in sorted(weighted_edges, key=lambda item: item[2], reverse=True):
+        if union(int(source), int(target)):
+            selected.add(tuple(sorted((int(source), int(target)))))
+    return selected
+
+
 def _graph_nodes_from_targets(
     skeleton: np.ndarray,
     junction: np.ndarray,
@@ -232,12 +264,16 @@ def _build_graph_training_targets(
 
     graph_node_capacity = np.zeros_like(skeleton, dtype=np.float32)
     graph_causal_path = np.zeros_like(skeleton, dtype=np.float32)
+    graph_backbone_path = np.zeros_like(skeleton, dtype=np.float32)
+    graph_redundant_path = np.zeros_like(skeleton, dtype=np.float32)
     pair_points = np.zeros((max_pairs, 2, 2), dtype=np.int64)
     pair_path_points = np.zeros((max_pairs, path_length, 2), dtype=np.int64)
     pair_path_mask = np.zeros((max_pairs, path_length), dtype=np.float32)
     pair_target = np.zeros((max_pairs,), dtype=np.float32)
     pair_importance = np.zeros((max_pairs,), dtype=np.float32)
     pair_valid = np.zeros((max_pairs,), dtype=np.float32)
+    pair_minimal_target = np.zeros((max_pairs,), dtype=np.float32)
+    pair_minimal_valid = np.zeros((max_pairs,), dtype=np.float32)
 
     positive_lookup = {
         tuple(sorted((source, target))): path for source, target, path in positive_edges
@@ -251,8 +287,12 @@ def _build_graph_training_targets(
             "graph_target": pair_target,
             "graph_pair_importance": pair_importance,
             "graph_pair_valid": pair_valid,
+            "graph_minimal_target": pair_minimal_target,
+            "graph_minimal_valid": pair_minimal_valid,
             "graph_node_capacity": graph_node_capacity[None, ...],
             "graph_causal_path": graph_causal_path[None, ...],
+            "graph_backbone_path": graph_backbone_path[None, ...],
+            "graph_redundant_path": graph_redundant_path[None, ...],
         }
 
     adjacency: dict[int, set[int]] = {int(node["index"]): set() for node in nodes}
@@ -279,6 +319,47 @@ def _build_graph_training_targets(
         for y, x in node["pixels"]:
             graph_node_capacity[y, x] = capacity
 
+    weighted_positive_edges: list[tuple[int, int, float]] = []
+    for source, target, path in positive_edges:
+        pair = tuple(sorted((source, target)))
+        path_bonus = float(min(len(path) / max(diagonal_length, 1.0), 1.0))
+        edge_score = float(positive_importance.get(pair, 0.0) + 0.10 * path_bonus)
+        weighted_positive_edges.append((source, target, edge_score))
+    forest_positive_pairs = _maximum_spanning_edge_subset(len(nodes), weighted_positive_edges)
+    if positive_importance:
+        importance_values = np.asarray(list(positive_importance.values()), dtype=np.float32)
+        backbone_threshold = float(np.quantile(importance_values, 0.70))
+        minimal_positive_pairs = {
+            pair for pair, importance in positive_importance.items() if float(importance) >= backbone_threshold
+        }
+        for node in nodes:
+            if node["kind"] != "junction":
+                continue
+            node_index = int(node["index"])
+            incident_pairs = [
+                (pair, importance)
+                for pair, importance in positive_importance.items()
+                if node_index in pair
+            ]
+            if incident_pairs:
+                best_pair = max(incident_pairs, key=lambda item: item[1])[0]
+                minimal_positive_pairs.add(best_pair)
+        if not minimal_positive_pairs:
+            minimal_positive_pairs = set(forest_positive_pairs)
+    else:
+        minimal_positive_pairs = set()
+
+    for source, target, path in positive_edges:
+        pair = tuple(sorted((source, target)))
+        importance = float(positive_importance.get(pair, 0.0))
+        if pair in minimal_positive_pairs:
+            for y, x in path:
+                graph_backbone_path[y, x] = max(graph_backbone_path[y, x], importance)
+        else:
+            redundancy_risk = float(np.clip(1.0 - importance, 0.0, 1.0))
+            for y, x in path:
+                graph_redundant_path[y, x] = max(graph_redundant_path[y, x], redundancy_risk)
+
     positive_pairs: list[tuple[tuple[int, int], list[tuple[int, int]]]] = list(positive_lookup.items())
     negative_pairs: list[tuple[int, int, float]] = []
     for left in range(len(nodes)):
@@ -293,24 +374,64 @@ def _build_graph_training_targets(
                 negative_pairs.append((left, right, distance))
     negative_pairs.sort(key=lambda item: item[2])
 
-    max_positive = min(len(positive_pairs), max(max_pairs // 2, 1))
-    if len(positive_pairs) > max_positive > 0:
-        sample_indices = np.linspace(0, len(positive_pairs) - 1, max_positive).round().astype(int)
-        selected_positive = [positive_pairs[index] for index in sample_indices.tolist()]
+    max_positive = min(len(positive_pairs), max((3 * max_pairs) // 4, 1))
+    minimal_positive = [
+        item for item in positive_pairs if tuple(sorted(item[0])) in minimal_positive_pairs
+    ]
+    redundant_positive = [
+        item for item in positive_pairs if tuple(sorted(item[0])) not in minimal_positive_pairs
+    ]
+    if len(minimal_positive) > max_positive > 0:
+        minimal_positive.sort(
+            key=lambda item: positive_importance.get(tuple(sorted(item[0])), 0.0),
+            reverse=True,
+        )
+        selected_positive = minimal_positive[:max_positive]
     else:
-        selected_positive = positive_pairs
+        selected_positive = list(minimal_positive)
+        remaining_positive = max_positive - len(selected_positive)
+        if len(redundant_positive) > remaining_positive > 0:
+            sample_indices = np.linspace(
+                0,
+                len(redundant_positive) - 1,
+                remaining_positive,
+            ).round().astype(int)
+            selected_positive.extend([redundant_positive[index] for index in sample_indices.tolist()])
+        else:
+            selected_positive.extend(redundant_positive)
 
-    pair_records: list[tuple[int, int, float, float, list[tuple[int, int]]]] = []
+    pair_records: list[tuple[int, int, float, float, float, float, list[tuple[int, int]]]] = []
     for (source, target), path in selected_positive:
-        pair_records.append((source, target, 1.0, float(positive_importance.get((source, target), 1.0)), path))
+        pair_key = tuple(sorted((source, target)))
+        pair_records.append(
+            (
+                source,
+                target,
+                1.0,
+                float(positive_importance.get(pair_key, 1.0)),
+                1.0 if pair_key in minimal_positive_pairs else 0.0,
+                1.0,
+                path,
+            )
+        )
 
     remaining = max_pairs - len(pair_records)
     for source, target, _ in negative_pairs[: max(remaining, 0)]:
         pair_records.append(
-            (source, target, 0.0, 0.0, _line_points(nodes[source]["point"], nodes[target]["point"]))
+            (
+                source,
+                target,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                _line_points(nodes[source]["point"], nodes[target]["point"]),
+            )
         )
 
-    for pair_index, (source, target, label, importance, path) in enumerate(pair_records[:max_pairs]):
+    for pair_index, (source, target, label, importance, minimal_label, minimal_valid, path) in enumerate(
+        pair_records[:max_pairs]
+    ):
         pair_points[pair_index, 0] = np.asarray(nodes[source]["point"], dtype=np.int64)
         pair_points[pair_index, 1] = np.asarray(nodes[target]["point"], dtype=np.int64)
         sampled_path, sampled_mask = _sample_path_points(path, path_length)
@@ -319,6 +440,8 @@ def _build_graph_training_targets(
         pair_target[pair_index] = float(label)
         pair_importance[pair_index] = float(importance)
         pair_valid[pair_index] = 1.0
+        pair_minimal_target[pair_index] = float(minimal_label)
+        pair_minimal_valid[pair_index] = float(minimal_valid)
 
     return {
         "graph_pair_points": pair_points,
@@ -327,8 +450,12 @@ def _build_graph_training_targets(
         "graph_target": pair_target,
         "graph_pair_importance": pair_importance,
         "graph_pair_valid": pair_valid,
+        "graph_minimal_target": pair_minimal_target,
+        "graph_minimal_valid": pair_minimal_valid,
         "graph_node_capacity": graph_node_capacity[None, ...],
         "graph_causal_path": graph_causal_path[None, ...],
+        "graph_backbone_path": graph_backbone_path[None, ...],
+        "graph_redundant_path": graph_redundant_path[None, ...],
     }
 
 

@@ -31,6 +31,17 @@ class GraphEdge:
     path: list[tuple[int, int]]
 
 
+@dataclass
+class CandidateBridge:
+    source: int
+    target: int
+    score: float
+    relation_prob: float
+    path_support: float
+    uncertainty: float
+    path: list[tuple[int, int]]
+
+
 class GraphBuilder:
     def __init__(
         self,
@@ -61,6 +72,11 @@ class GraphBuilder:
         prune_min_component_length: int = 80,
         prune_component_score: float = 0.78,
         enforce_tree: bool = False,
+        candidate_distance_ratio: float = 1.35,
+        candidate_support_ratio: float = 0.78,
+        candidate_score_ratio: float = 0.82,
+        candidate_relation_threshold: float = 0.52,
+        max_candidate_bridges: int = 96,
     ) -> None:
         self.node_threshold = node_threshold
         self.mask_threshold = mask_threshold
@@ -89,6 +105,11 @@ class GraphBuilder:
         self.prune_min_component_length = prune_min_component_length
         self.prune_component_score = prune_component_score
         self.enforce_tree = enforce_tree
+        self.candidate_distance_ratio = candidate_distance_ratio
+        self.candidate_support_ratio = candidate_support_ratio
+        self.candidate_score_ratio = candidate_score_ratio
+        self.candidate_relation_threshold = candidate_relation_threshold
+        self.max_candidate_bridges = max_candidate_bridges
 
     def __call__(self, predictions: dict[str, torch.Tensor]) -> dict[str, Any]:
         mask = torch.sigmoid(predictions["mask_logits"][0, 0])
@@ -136,7 +157,7 @@ class GraphBuilder:
         )
 
         nodes = self._extract_nodes(junction, endpoint, skeleton, relay, bridge, dense_sparse_projection)
-        edges = self._propose_edges(
+        edges, candidate_bridges = self._propose_edges(
             nodes,
             mask,
             skeleton,
@@ -156,6 +177,7 @@ class GraphBuilder:
         raw_nodes = list(nodes)
         raw_edges = list(edges)
         nodes, edges = self._prune_graph(nodes, edges)
+        candidate_bridges = self._filter_candidate_bridges(nodes, edges, candidate_bridges)
 
         graph = nx.Graph()
         for node in nodes:
@@ -175,6 +197,7 @@ class GraphBuilder:
             "graph": graph,
             "raw_nodes": raw_nodes,
             "raw_edges": raw_edges,
+            "candidate_bridges": candidate_bridges,
         }
 
     def _extract_nodes(
@@ -234,8 +257,10 @@ class GraphBuilder:
         counterfactual_gate: torch.Tensor | None,
         node_capacity: torch.Tensor | None,
         causal_saliency: torch.Tensor | None,
-    ) -> list[GraphEdge]:
+    ) -> tuple[list[GraphEdge], list[CandidateBridge]]:
         edges: list[GraphEdge] = []
+        candidate_bridges: list[CandidateBridge] = []
+        candidate_pairs: set[tuple[int, int]] = set()
         used_pairs: set[tuple[int, int]] = set()
         degree_budget = {}
         for node in nodes:
@@ -277,6 +302,9 @@ class GraphBuilder:
         )
         node_capacity_np = node_capacity.detach().cpu().numpy() if node_capacity is not None else None
         causal_saliency_np = causal_saliency.detach().cpu().numpy() if causal_saliency is not None else None
+        candidate_distance_limit = float(self.max_neighbor_distance) * float(self.candidate_distance_ratio)
+        candidate_support_threshold = float(self.min_path_support) * float(self.candidate_support_ratio)
+        candidate_score_threshold = float(self.min_path_support) * float(self.candidate_score_ratio)
 
         for node in nodes:
             distances: list[tuple[float, GraphNode]] = []
@@ -291,8 +319,10 @@ class GraphBuilder:
                 if current_degree[node.index] >= degree_budget[node.index]:
                     break
                 if current_degree[other.index] >= degree_budget[other.index]:
-                    continue
-                if distance > self.max_neighbor_distance:
+                    over_budget = True
+                else:
+                    over_budget = False
+                if distance > candidate_distance_limit:
                     break
 
                 pair = tuple(sorted((node.index, other.index)))
@@ -329,7 +359,34 @@ class GraphBuilder:
                     uncertainty_np,
                 )
                 edge_score = (1.0 - self.relation_weight) * heuristic_score + self.relation_weight * relation_prob
-                if path_support < self.min_path_support or edge_score < self.min_path_support:
+                meets_confirmed = (
+                    not over_budget
+                    and distance <= float(self.max_neighbor_distance)
+                    and path_support >= float(self.min_path_support)
+                    and edge_score >= float(self.min_path_support)
+                )
+                if not meets_confirmed:
+                    if (
+                        pair not in candidate_pairs
+                        and len(candidate_bridges) < int(self.max_candidate_bridges)
+                        and distance <= candidate_distance_limit
+                        and path_support >= candidate_support_threshold
+                        and edge_score >= candidate_score_threshold
+                        and relation_prob >= float(self.candidate_relation_threshold)
+                        and ("endpoint" in {node.kind, other.kind} or over_budget)
+                    ):
+                        candidate_bridges.append(
+                            CandidateBridge(
+                                source=pair[0],
+                                target=pair[1],
+                                score=float(edge_score),
+                                relation_prob=float(relation_prob),
+                                path_support=float(path_support),
+                                uncertainty=float(mean_uncertainty),
+                                path=path,
+                            )
+                        )
+                        candidate_pairs.add(pair)
                     continue
 
                 edges.append(
@@ -343,7 +400,11 @@ class GraphBuilder:
                 used_pairs.add(pair)
                 current_degree[node.index] += 1
                 current_degree[other.index] += 1
-        return edges
+        candidate_bridges.sort(
+            key=lambda bridge: (bridge.score, bridge.relation_prob, bridge.path_support),
+            reverse=True,
+        )
+        return edges, candidate_bridges[: int(self.max_candidate_bridges)]
 
     def _route_path(
         self,
@@ -502,6 +563,46 @@ class GraphBuilder:
         kept_indices = {index for edge in working_edges for index in (edge.source, edge.target)}
         kept_nodes = [node for node in nodes if node.index in kept_indices]
         return kept_nodes, working_edges
+
+    def _filter_candidate_bridges(
+        self,
+        nodes: list[GraphNode],
+        edges: list[GraphEdge],
+        candidate_bridges: list[CandidateBridge],
+    ) -> list[CandidateBridge]:
+        if not candidate_bridges:
+            return []
+
+        graph = nx.Graph()
+        for node in nodes:
+            graph.add_node(node.index)
+        for edge in edges:
+            graph.add_edge(edge.source, edge.target)
+
+        component_lookup: dict[int, int] = {}
+        for component_index, component in enumerate(nx.connected_components(graph)):
+            for node_index in component:
+                component_lookup[int(node_index)] = component_index
+
+        filtered: list[CandidateBridge] = []
+        seen_pairs: set[tuple[int, int]] = set()
+        for bridge in sorted(
+            candidate_bridges,
+            key=lambda item: (item.score, item.relation_prob, item.path_support),
+            reverse=True,
+        ):
+            pair = tuple(sorted((bridge.source, bridge.target)))
+            if pair in seen_pairs:
+                continue
+            left_component = component_lookup.get(bridge.source, -1)
+            right_component = component_lookup.get(bridge.target, -2)
+            if left_component == right_component and left_component >= 0:
+                continue
+            filtered.append(bridge)
+            seen_pairs.add(pair)
+            if len(filtered) >= int(self.max_candidate_bridges):
+                break
+        return filtered
 
     def _node_degrees(self, edges: list[GraphEdge]) -> dict[int, int]:
         degrees: dict[int, int] = {}

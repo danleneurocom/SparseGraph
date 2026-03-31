@@ -255,6 +255,32 @@ def graph_to_json(graph_result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def candidate_bridges_to_json(
+    graph_result: dict[str, Any],
+) -> dict[str, Any]:
+    node_lookup = {int(node.index): node for node in graph_result.get("raw_nodes", graph_result.get("nodes", []))}
+    return {
+        "candidate_bridges": [
+            {
+                "source": int(bridge.source),
+                "target": int(bridge.target),
+                "score": float(bridge.score),
+                "relation_prob": float(bridge.relation_prob),
+                "path_support": float(bridge.path_support),
+                "uncertainty": float(bridge.uncertainty),
+                "source_kind": node_lookup.get(int(bridge.source)).kind if int(bridge.source) in node_lookup else "unknown",
+                "target_kind": node_lookup.get(int(bridge.target)).kind if int(bridge.target) in node_lookup else "unknown",
+                "source_y": int(node_lookup.get(int(bridge.source)).y) if int(bridge.source) in node_lookup else -1,
+                "source_x": int(node_lookup.get(int(bridge.source)).x) if int(bridge.source) in node_lookup else -1,
+                "target_y": int(node_lookup.get(int(bridge.target)).y) if int(bridge.target) in node_lookup else -1,
+                "target_x": int(node_lookup.get(int(bridge.target)).x) if int(bridge.target) in node_lookup else -1,
+                "path": [[int(y), int(x)] for y, x in bridge.path],
+            }
+            for bridge in graph_result.get("candidate_bridges", [])
+        ]
+    }
+
+
 def apply_preset(post_cfg: dict[str, Any], preset: str) -> dict[str, Any]:
     if preset == "default":
         post_cfg.setdefault("prune_mode", "none")
@@ -284,19 +310,19 @@ def apply_preset(post_cfg: dict[str, Any], preset: str) -> dict[str, Any]:
     if preset == "reviewer":
         post_cfg.update(
             {
-                "node_threshold": max(float(post_cfg.get("node_threshold", 0.4)), 0.54),
-                "skeleton_threshold": max(float(post_cfg.get("skeleton_threshold", 0.45)), 0.60),
-                "max_neighbor_distance": min(int(post_cfg.get("max_neighbor_distance", 20)), 14),
-                "min_path_support": max(float(post_cfg.get("min_path_support", 0.28)), 0.46),
+                "node_threshold": max(float(post_cfg.get("node_threshold", 0.4)), 0.58),
+                "skeleton_threshold": max(float(post_cfg.get("skeleton_threshold", 0.45)), 0.64),
+                "max_neighbor_distance": min(int(post_cfg.get("max_neighbor_distance", 20)), 12),
+                "min_path_support": max(float(post_cfg.get("min_path_support", 0.28)), 0.52),
                 "max_neighbors_per_node": min(int(post_cfg.get("max_neighbors_per_node", 3)), 2),
                 "prune_mode": "reviewer",
-                "prune_terminal_score": 0.78,
-                "prune_terminal_node_score": 0.88,
-                "prune_min_spur_length": 44,
-                "prune_keep_trunk_length": 108,
-                "prune_keep_edge_score": 0.94,
-                "prune_min_component_length": 104,
-                "prune_component_score": 0.84,
+                "prune_terminal_score": 0.82,
+                "prune_terminal_node_score": 0.90,
+                "prune_min_spur_length": 52,
+                "prune_keep_trunk_length": 112,
+                "prune_keep_edge_score": 0.95,
+                "prune_min_component_length": 120,
+                "prune_component_score": 0.88,
                 "enforce_tree": True,
             }
         )
@@ -361,6 +387,7 @@ def render_extraction_visual(
     mask_prob: np.ndarray,
     skeleton_prob: np.ndarray,
     graph_result: dict[str, Any],
+    candidate_bridges: list[Any] | None = None,
     dense_sparse_projection_prob: np.ndarray | None = None,
     skeleton_threshold: float = 0.5,
 ) -> dict[str, np.ndarray]:
@@ -368,8 +395,10 @@ def render_extraction_visual(
     dense_rgb = original_rgb * 0.78
     sparse_rgb = original_rgb * 0.60
     graph_rgb = original_rgb * 0.72
+    candidate_rgb = original_rgb * 0.72
     sparse_only_rgb = np.zeros_like(original_rgb, dtype=np.float32)
     graph_only_rgb = np.zeros_like(original_rgb, dtype=np.float32)
+    candidate_only_rgb = np.zeros_like(original_rgb, dtype=np.float32)
 
     mask_alpha = np.clip(mask_prob * 0.22, 0.0, 0.22)[..., None]
     mask_color = np.array([1.0, 0.45, 0.12], dtype=np.float32)
@@ -386,6 +415,7 @@ def render_extraction_visual(
         projection_color = np.array([0.92, 0.20, 0.88], dtype=np.float32)
         sparse_rgb = sparse_rgb * (1.0 - projection_alpha) + projection_alpha * projection_color
         graph_rgb = graph_rgb * (1.0 - 0.5 * projection_alpha) + 0.5 * projection_alpha * projection_color
+        candidate_rgb = candidate_rgb * (1.0 - 0.5 * projection_alpha) + 0.5 * projection_alpha * projection_color
         sparse_only_rgb = sparse_only_rgb + np.clip(dense_sparse_projection_prob * 0.45, 0.0, 0.45)[..., None] * projection_color
 
     binary_skeleton = (skeleton_prob >= float(skeleton_threshold)).astype(np.float32)
@@ -399,15 +429,24 @@ def render_extraction_visual(
         color = (1.0, 0.18, 0.20) if node.kind == "junction" else (0.15, 1.0, 0.35)
         _paint_square(graph_rgb, int(node.y), int(node.x), color=color, radius=2)
         _paint_square(graph_only_rgb, int(node.y), int(node.x), color=color, radius=2)
+        _paint_square(candidate_rgb, int(node.y), int(node.x), color=color, radius=2)
+
+    for bridge in candidate_bridges or []:
+        for y, x in bridge.path:
+            _paint_square(candidate_rgb, int(y), int(x), color=(0.96, 0.38, 1.0), radius=1)
+            _paint_square(candidate_only_rgb, int(y), int(x), color=(0.96, 0.38, 1.0), radius=1)
 
     dense_rgb = np.clip(dense_rgb, 0.0, 1.0)
     sparse_rgb = np.clip(sparse_rgb, 0.0, 1.0)
     graph_rgb = np.clip(graph_rgb, 0.0, 1.0)
+    candidate_rgb = np.clip(candidate_rgb, 0.0, 1.0)
     sparse_only_rgb = np.clip(sparse_only_rgb, 0.0, 1.0)
     graph_only_rgb = np.clip(graph_only_rgb, 0.0, 1.0)
+    candidate_only_rgb = np.clip(candidate_only_rgb, 0.0, 1.0)
     comparison_rgb = _stack_panels([original_rgb, graph_rgb])
     storyboard_rgb = _stack_panels([original_rgb, dense_rgb, sparse_rgb, graph_rgb])
     sparse_storyboard_rgb = _stack_panels([sparse_only_rgb, binary_skeleton_rgb, graph_only_rgb])
+    mapping_storyboard_rgb = _stack_panels([original_rgb, graph_rgb, candidate_rgb, candidate_only_rgb])
     return {
         "original": original_rgb,
         "dense": dense_rgb,
@@ -416,9 +455,12 @@ def render_extraction_visual(
         "binary_skeleton": binary_skeleton_rgb,
         "graph": graph_rgb,
         "graph_only": graph_only_rgb,
+        "candidate": candidate_rgb,
+        "candidate_only": candidate_only_rgb,
         "comparison": comparison_rgb,
         "storyboard": storyboard_rgb,
         "sparse_storyboard": sparse_storyboard_rgb,
+        "mapping_storyboard": mapping_storyboard_rgb,
     }
 
 
@@ -428,6 +470,7 @@ def save_visual_outputs(
     mask_prob: np.ndarray,
     skeleton_prob: np.ndarray,
     graph_result: dict[str, Any],
+    candidate_bridges: list[Any] | None = None,
     dense_sparse_projection_prob: np.ndarray | None = None,
     skeleton_threshold: float = 0.5,
 ) -> dict[str, str]:
@@ -436,6 +479,7 @@ def save_visual_outputs(
         mask_prob=mask_prob,
         skeleton_prob=skeleton_prob,
         graph_result=graph_result,
+        candidate_bridges=candidate_bridges,
         dense_sparse_projection_prob=dense_sparse_projection_prob,
         skeleton_threshold=skeleton_threshold,
     )
@@ -447,10 +491,13 @@ def save_visual_outputs(
         "binary_skeleton_view": output_dir / "binary_skeleton.png",
         "graph_view": output_dir / "graph_view.png",
         "graph_only_view": output_dir / "graph_only.png",
+        "candidate_view": output_dir / "candidate_view.png",
+        "candidate_only_view": output_dir / "candidate_only.png",
         "extraction_view": output_dir / "extraction_view.png",
         "comparison_view": output_dir / "comparison.png",
         "storyboard_view": output_dir / "storyboard.png",
         "sparse_storyboard_view": output_dir / "sparse_storyboard.png",
+        "mapping_storyboard_view": output_dir / "mapping_storyboard.png",
     }
     visual_arrays = {
         "original_view": visuals["original"],
@@ -460,10 +507,13 @@ def save_visual_outputs(
         "binary_skeleton_view": visuals["binary_skeleton"],
         "graph_view": visuals["graph"],
         "graph_only_view": visuals["graph_only"],
+        "candidate_view": visuals["candidate"],
+        "candidate_only_view": visuals["candidate_only"],
         "extraction_view": visuals["graph"],
         "comparison_view": visuals["comparison"],
         "storyboard_view": visuals["storyboard"],
         "sparse_storyboard_view": visuals["sparse_storyboard"],
+        "mapping_storyboard_view": visuals["mapping_storyboard"],
     }
     for key, path in visual_paths.items():
         imsave(path, (visual_arrays[key] * 255.0).astype(np.uint8), check_contrast=False)
@@ -560,6 +610,7 @@ def main() -> None:
         mask_prob=mask_prob.astype(np.float32),
         skeleton_prob=skeleton_prob.astype(np.float32),
         graph_result=graph_result,
+        candidate_bridges=graph_result.get("candidate_bridges", []),
         dense_sparse_projection_prob=dense_sparse_projection_prob.astype(np.float32)
         if dense_sparse_projection_prob is not None
         else None,
@@ -580,6 +631,36 @@ def main() -> None:
                 handle,
                 indent=2,
             )
+    if graph_result.get("candidate_bridges"):
+        with (output_dir / "candidate_bridges.json").open("w", encoding="utf-8") as handle:
+            json.dump(candidate_bridges_to_json(graph_result), handle, indent=2)
+
+    graph_mask = np.zeros_like(confidence_map, dtype=bool)
+    for edge in graph_result["edges"]:
+        for y, x in edge.path:
+            graph_mask[int(y), int(x)] = True
+    structure_mask = skeleton_prob >= float(post_cfg.get("skeleton_threshold", 0.5))
+    candidate_mask = np.zeros_like(confidence_map, dtype=bool)
+    for bridge in graph_result.get("candidate_bridges", []):
+        for y, x in bridge.path:
+            candidate_mask[int(y), int(x)] = True
+
+    mean_structure_confidence = float(confidence_map[structure_mask].mean()) if np.any(structure_mask) else 0.0
+    mean_graph_confidence = float(confidence_map[graph_mask].mean()) if np.any(graph_mask) else 0.0
+    mean_edge_score = (
+        float(np.mean([edge.score for edge in graph_result["edges"]])) if graph_result["edges"] else 0.0
+    )
+    mean_node_score = (
+        float(np.mean([node.score for node in graph_result["nodes"]])) if graph_result["nodes"] else 0.0
+    )
+    mean_candidate_bridge_score = (
+        float(np.mean([bridge.score for bridge in graph_result.get("candidate_bridges", [])]))
+        if graph_result.get("candidate_bridges")
+        else 0.0
+    )
+    mean_candidate_confidence = (
+        float(confidence_map[candidate_mask].mean()) if np.any(candidate_mask) else 0.0
+    )
 
     metadata = {
         "input_path": str(input_path),
@@ -593,7 +674,15 @@ def main() -> None:
         "num_edges": len(graph_result["edges"]),
         "raw_num_nodes": len(graph_result.get("raw_nodes", graph_result["nodes"])),
         "raw_num_edges": len(graph_result.get("raw_edges", graph_result["edges"])),
+        "num_candidate_bridges": len(graph_result.get("candidate_bridges", [])),
         "mean_confidence": float(confidence_map.mean()),
+        "mean_confidence_all_pixels": float(confidence_map.mean()),
+        "mean_confidence_structure": mean_structure_confidence,
+        "mean_confidence_graph": mean_graph_confidence,
+        "mean_confidence_candidate_bridges": mean_candidate_confidence,
+        "mean_edge_score": mean_edge_score,
+        "mean_node_score": mean_node_score,
+        "mean_candidate_bridge_score": mean_candidate_bridge_score,
         "model_config": config["model"],
         "postprocess": post_cfg,
         "visuals": visual_paths,
@@ -604,7 +693,8 @@ def main() -> None:
     print(
         f"Saved extraction outputs to {output_dir} | "
         f"nodes={len(graph_result['nodes'])} | edges={len(graph_result['edges'])} | "
-        f"mean_confidence={confidence_map.mean():.4f}"
+        f"candidate_bridges={len(graph_result.get('candidate_bridges', []))} | "
+        f"graph_confidence={mean_graph_confidence:.4f}"
     )
 
 
