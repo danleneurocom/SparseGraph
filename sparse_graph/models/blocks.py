@@ -904,11 +904,22 @@ class CausalBranchAusterity(nn.Module):
             0.0,
             1.0,
         )
+        stable_node_context = torch.clamp(
+            torch.maximum(junction_context, 0.55 * endpoint_context) * (0.65 + 0.35 * node_capacity_prob),
+            0.0,
+            1.0,
+        )
+        projection_surplus = torch.clamp(dense_sparse_projection_prob - essential_prior, 0.0, 1.0)
+        endpoint_branch_risk = torch.clamp(branch_proxy * endpoint_context * (1.0 - junction_context), 0.0, 1.0)
+        capacity_gap = torch.clamp(branch_proxy - node_capacity_prob, 0.0, 1.0)
         surplus_risk = torch.clamp(
-            0.55 * branch_proxy * (1.0 - junction_context)
+            0.40 * branch_proxy * (1.0 - stable_node_context)
             + 0.20 * bridge_prob * (1.0 - path_memory_prob)
             + 0.15 * counterfactual_gap
-            + 0.10 * relay_prob * (1.0 - node_capacity_prob),
+            + 0.10 * relay_prob * (1.0 - node_capacity_prob)
+            + 0.12 * endpoint_branch_risk
+            + 0.10 * projection_surplus
+            + 0.08 * capacity_gap,
             0.0,
             1.0,
         )
@@ -916,7 +927,9 @@ class CausalBranchAusterity(nn.Module):
         branch_prune_logits = self.branch_prune_head(policy_state)
         branch_keep = torch.clamp(0.55 * torch.sigmoid(branch_keep_logits) + 0.45 * essential_prior, 0.0, 1.0)
         branch_prune = torch.clamp(
-            torch.sigmoid(branch_prune_logits) * surplus_risk * (1.0 - 0.55 * dense_sparse_projection_prob),
+            torch.sigmoid(branch_prune_logits)
+            * surplus_risk
+            * (1.0 - 0.25 * dense_sparse_projection_prob * stable_node_context),
             0.0,
             1.0,
         )
@@ -948,7 +961,7 @@ class CausalBranchAusterity(nn.Module):
                     * (1.0 + keep_gate * branch_keep)
                     * (1.0 + 0.35 * causal_saliency_prob)
                     * (1.0 + 0.30 * dense_sparse_projection_prob)
-                    * (1.0 - 0.65 * prune_gate * branch_prune)
+                    * (1.0 - 0.78 * prune_gate * branch_prune)
                     * (1.0 + 0.20 * node_support),
                     policy_state
                     + keep_features

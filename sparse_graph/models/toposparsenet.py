@@ -153,6 +153,7 @@ class TopoSparseNet(nn.Module):
         self.skeleton_head = PredictionHead(feature_channels, 1)
         self.junction_head = PredictionHead(feature_channels, 1)
         self.endpoint_head = PredictionHead(feature_channels, 1)
+        self.node_degree_head = PredictionHead(feature_channels, 1)
         self.affinity_head = PredictionHead(feature_channels, affinity_channels)
         self.uncertainty_head = PredictionHead(feature_channels, 1)
 
@@ -327,6 +328,7 @@ class TopoSparseNet(nn.Module):
             skeleton_logits = self.skeleton_head(sparse_features)
             junction_logits = self.junction_head(sparse_features)
             endpoint_logits = self.endpoint_head(sparse_features)
+            node_degree_logits = self.node_degree_head(sparse_features)
             affinity_logits = self.affinity_head(sparse_features)
             uncertainty_logits = self.uncertainty_head(dense_features)
             if "bridge_logits" in outputs:
@@ -351,12 +353,15 @@ class TopoSparseNet(nn.Module):
                 skeleton_logits = skeleton_logits - 0.20 * outputs["branch_prune_logits"]
             if "conflict_logits" in outputs:
                 uncertainty_logits = uncertainty_logits + outputs["conflict_logits"]
+            if "node_capacity_logits" in outputs:
+                node_degree_logits = node_degree_logits + 0.35 * outputs["node_capacity_logits"]
             outputs.update(
                 {
                     "mask_logits": mask_logits,
                     "skeleton_logits": skeleton_logits,
                     "junction_logits": junction_logits,
                     "endpoint_logits": endpoint_logits,
+                    "node_degree_logits": node_degree_logits,
                     "affinity": affinity_logits,
                     "uncertainty_logits": uncertainty_logits,
                 }
@@ -368,6 +373,7 @@ class TopoSparseNet(nn.Module):
                     "skeleton_logits": self.skeleton_head(dense_features),
                     "junction_logits": self.junction_head(dense_features),
                     "endpoint_logits": self.endpoint_head(dense_features),
+                    "node_degree_logits": self.node_degree_head(dense_features),
                     "affinity": self.affinity_head(dense_features),
                     "uncertainty_logits": self.uncertainty_head(dense_features),
                 }

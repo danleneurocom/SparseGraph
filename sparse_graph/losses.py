@@ -16,6 +16,22 @@ def dice_loss_from_probs(pred: torch.Tensor, target: torch.Tensor, eps: float = 
     return 1.0 - dice.mean()
 
 
+def tversky_loss_from_probs(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    alpha: float = 0.7,
+    beta: float = 0.3,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    pred = pred.flatten(1)
+    target = target.flatten(1)
+    true_positive = (pred * target).sum(dim=1)
+    false_positive = (pred * (1.0 - target)).sum(dim=1)
+    false_negative = ((1.0 - pred) * target).sum(dim=1)
+    score = (true_positive + eps) / (true_positive + alpha * false_positive + beta * false_negative + eps)
+    return 1.0 - score.mean()
+
+
 def binary_focal_loss_with_logits(
     logits: torch.Tensor,
     target: torch.Tensor,
@@ -28,6 +44,19 @@ def binary_focal_loss_with_logits(
     alpha_t = alpha * target + (1.0 - alpha) * (1.0 - target)
     loss = alpha_t * ((1.0 - p_t) ** gamma) * bce
     return loss.mean()
+
+
+def soft_heatmap_loss_from_logits(
+    logits: torch.Tensor,
+    target_heatmap: torch.Tensor,
+    target_binary: torch.Tensor | None = None,
+) -> torch.Tensor:
+    probs = torch.sigmoid(logits)
+    loss = dice_loss_from_probs(probs, target_heatmap)
+    loss = loss + 0.5 * F.binary_cross_entropy_with_logits(logits, target_heatmap)
+    if target_binary is not None:
+        loss = loss + 0.35 * binary_focal_loss_with_logits(logits, target_binary)
+    return loss
 
 
 def soft_erode(img: torch.Tensor) -> torch.Tensor:
@@ -284,27 +313,43 @@ class TopoSparseObjective(nn.Module):
         mask_probs = torch.sigmoid(predictions["mask_logits"])
         skeleton_probs = torch.sigmoid(predictions["skeleton_logits"])
         uncertainty_probs = torch.sigmoid(predictions["uncertainty_logits"])
+        junction_target = batch.get("junction_heatmap", batch["junction"])
+        endpoint_target = batch.get("endpoint_heatmap", batch["endpoint"])
+        node_focus_target = torch.maximum(junction_target, endpoint_target)
 
         mask_loss = dice_loss_from_probs(mask_probs, batch["mask"]) + binary_focal_loss_with_logits(
             predictions["mask_logits"], batch["mask"]
         )
-        skeleton_loss = dice_loss_from_probs(skeleton_probs, batch["skeleton"])
+        skeleton_loss = dice_loss_from_probs(skeleton_probs, batch["skeleton"]) + 0.30 * tversky_loss_from_probs(
+            skeleton_probs,
+            batch["skeleton"],
+            alpha=0.72,
+            beta=0.28,
+        )
         topology_loss = cldice_loss(
             mask_probs,
             batch["mask"],
             iterations=int(self.weights.get("skeleton_iterations", 10)),
         )
-        junction_loss = binary_focal_loss_with_logits(predictions["junction_logits"], batch["junction"])
-        endpoint_loss = binary_focal_loss_with_logits(predictions["endpoint_logits"], batch["endpoint"])
+        junction_loss = soft_heatmap_loss_from_logits(
+            predictions["junction_logits"],
+            junction_target,
+            batch["junction"],
+        )
+        endpoint_loss = soft_heatmap_loss_from_logits(
+            predictions["endpoint_logits"],
+            endpoint_target,
+            batch["endpoint"],
+        )
         node_loss = 0.5 * (junction_loss + endpoint_loss)
         node_tolerance_loss = 0.5 * (
             dice_loss_from_probs(
                 torch.sigmoid(predictions["junction_logits"]),
-                F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2),
+                F.max_pool2d(junction_target, kernel_size=5, stride=1, padding=2),
             )
             + dice_loss_from_probs(
                 torch.sigmoid(predictions["endpoint_logits"]),
-                F.max_pool2d(batch["endpoint"], kernel_size=5, stride=1, padding=2),
+                F.max_pool2d(endpoint_target, kernel_size=5, stride=1, padding=2),
             )
         )
         affinity_loss = masked_smooth_l1(
@@ -323,17 +368,13 @@ class TopoSparseObjective(nn.Module):
         pred_degree = soft_neighbor_degree(skeleton_probs)
         branchpoint_probs = soft_branchpoint_map(skeleton_probs)
         endpoint_from_skeleton = soft_endpoint_map(skeleton_probs)
-        node_focus = F.max_pool2d(
-            torch.maximum(batch["junction"], batch["endpoint"]),
-            kernel_size=5,
-            stride=1,
-            padding=2,
-        )
+        node_focus = F.max_pool2d(node_focus_target, kernel_size=5, stride=1, padding=2)
         support_loss = predictions["mask_logits"].new_tensor(0.0)
         bio_prior_loss = predictions["mask_logits"].new_tensor(0.0)
         causal_loss = predictions["mask_logits"].new_tensor(0.0)
         relay_loss = predictions["mask_logits"].new_tensor(0.0)
         node_policy_loss = predictions["mask_logits"].new_tensor(0.0)
+        node_degree_loss = predictions["mask_logits"].new_tensor(0.0)
         graph_importance_loss = predictions["mask_logits"].new_tensor(0.0)
         graph_minimal_loss = predictions["mask_logits"].new_tensor(0.0)
         branch_budget_loss = predictions["mask_logits"].new_tensor(0.0)
@@ -352,6 +393,14 @@ class TopoSparseObjective(nn.Module):
             target_degree,
             node_focus,
         )
+        non_node_zone = 1.0 - F.max_pool2d(node_focus_target, kernel_size=7, stride=1, padding=3)
+        degree_excess = torch.clamp(pred_degree - (target_degree + 0.35), min=0.0) / 4.0
+        branch_budget_loss = branch_budget_loss + 0.30 * (degree_excess * non_node_zone).mean()
+        branch_budget_loss = branch_budget_loss + 0.20 * (
+            branchpoint_probs
+            * non_node_zone
+            * (1.0 - batch.get("graph_backbone_path", batch["skeleton"]))
+        ).mean()
         pred_branch_count = branchpoint_probs.flatten(1).sum(dim=1)
         target_branch_count = batch["junction"].flatten(1).sum(dim=1)
         pred_endpoint_count = endpoint_from_skeleton.flatten(1).sum(dim=1)
@@ -369,11 +418,13 @@ class TopoSparseObjective(nn.Module):
         if "branch_keep_logits" in predictions and "branch_prune_logits" in predictions:
             graph_causal_target = batch.get("graph_causal_path", batch["skeleton"])
             node_context = F.max_pool2d(
-                torch.maximum(batch["junction"], batch["endpoint"]),
+                node_focus_target,
                 kernel_size=7,
                 stride=1,
                 padding=3,
             )
+            junction_buffer = F.max_pool2d(junction_target, kernel_size=7, stride=1, padding=3)
+            endpoint_buffer = F.max_pool2d(endpoint_target, kernel_size=7, stride=1, padding=3)
             keep_target = torch.clamp(
                 0.65 * graph_causal_target + 0.35 * node_context,
                 0.0,
@@ -382,7 +433,7 @@ class TopoSparseObjective(nn.Module):
             prune_target = torch.clamp(
                 F.max_pool2d(batch["mask"], kernel_size=5, stride=1, padding=2)
                 * (1.0 - F.max_pool2d(graph_causal_target, kernel_size=5, stride=1, padding=2))
-                * (1.0 - F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2)),
+                * (1.0 - 0.75 * junction_buffer),
                 0.0,
                 1.0,
             )
@@ -404,7 +455,7 @@ class TopoSparseObjective(nn.Module):
                 predictions["branch_prune_logits"],
                 prune_target,
             )
-            allowed_branch_zone = F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2)
+            allowed_branch_zone = F.max_pool2d(junction_target, kernel_size=5, stride=1, padding=2)
             branch_austerity_loss = branch_austerity_loss + 0.40 * (
                 soft_branchpoint_map(skeleton_probs) * (1.0 - allowed_branch_zone) * (1.0 - keep_target)
             ).mean()
@@ -412,6 +463,14 @@ class TopoSparseObjective(nn.Module):
                 skeleton_probs
                 * branch_prune_probs
                 * (1.0 - F.max_pool2d(batch["skeleton"], kernel_size=3, stride=1, padding=1))
+            ).mean()
+            branch_austerity_loss = branch_austerity_loss + 0.18 * (
+                branchpoint_probs
+                * endpoint_buffer
+                * (1.0 - junction_buffer)
+            ).mean()
+            branch_austerity_loss = branch_austerity_loss + 0.14 * (
+                degree_excess * (1.0 - junction_buffer) * (1.0 - keep_target)
             ).mean()
             if "graph_backbone_path" in batch and "graph_redundant_path" in batch:
                 backbone_target = batch["graph_backbone_path"].float()
@@ -441,6 +500,9 @@ class TopoSparseObjective(nn.Module):
                 branch_austerity_loss = branch_austerity_loss + 0.10 * (
                     torch.clamp(skeleton_probs - batch["skeleton"], 0.0, 1.0) * strict_redundant
                 ).mean()
+                branch_austerity_loss = branch_austerity_loss + 0.18 * (
+                    degree_excess * strict_redundant
+                ).mean()
 
         auxiliary_loss = predictions["mask_logits"].new_tensor(0.0)
         if "coarse_mask_logits" in predictions:
@@ -453,11 +515,15 @@ class TopoSparseObjective(nn.Module):
             coarse_skeleton_probs = torch.sigmoid(predictions["coarse_skeleton_logits"])
             auxiliary_loss = auxiliary_loss + dice_loss_from_probs(coarse_skeleton_probs, batch["skeleton"])
         if "coarse_junction_logits" in predictions and "coarse_endpoint_logits" in predictions:
-            coarse_junction_loss = binary_focal_loss_with_logits(
-                predictions["coarse_junction_logits"], batch["junction"]
+            coarse_junction_loss = soft_heatmap_loss_from_logits(
+                predictions["coarse_junction_logits"],
+                junction_target,
+                batch["junction"],
             )
-            coarse_endpoint_loss = binary_focal_loss_with_logits(
-                predictions["coarse_endpoint_logits"], batch["endpoint"]
+            coarse_endpoint_loss = soft_heatmap_loss_from_logits(
+                predictions["coarse_endpoint_logits"],
+                endpoint_target,
+                batch["endpoint"],
             )
             auxiliary_loss = auxiliary_loss + 0.5 * (coarse_junction_loss + coarse_endpoint_loss)
         if "rollout_mask_logits" in predictions:
@@ -472,11 +538,15 @@ class TopoSparseObjective(nn.Module):
                 rollout_skeleton_probs, batch["skeleton"]
             )
         if "rollout_junction_logits" in predictions and "rollout_endpoint_logits" in predictions:
-            rollout_junction_loss = binary_focal_loss_with_logits(
-                predictions["rollout_junction_logits"], batch["junction"]
+            rollout_junction_loss = soft_heatmap_loss_from_logits(
+                predictions["rollout_junction_logits"],
+                junction_target,
+                batch["junction"],
             )
-            rollout_endpoint_loss = binary_focal_loss_with_logits(
-                predictions["rollout_endpoint_logits"], batch["endpoint"]
+            rollout_endpoint_loss = soft_heatmap_loss_from_logits(
+                predictions["rollout_endpoint_logits"],
+                endpoint_target,
+                batch["endpoint"],
             )
             auxiliary_loss = auxiliary_loss + 0.5 * (rollout_junction_loss + rollout_endpoint_loss)
         if "relay_logits" in predictions:
@@ -503,25 +573,39 @@ class TopoSparseObjective(nn.Module):
                 predictions["counterfactual_bridge_logits"], batch["skeleton"]
             )
         if "endpoint_relay_logits" in predictions:
-            endpoint_relay_target = F.max_pool2d(batch["endpoint"], kernel_size=5, stride=1, padding=2)
+            endpoint_relay_target = F.max_pool2d(endpoint_target, kernel_size=5, stride=1, padding=2)
             endpoint_relay_probs = torch.sigmoid(predictions["endpoint_relay_logits"])
             relay_loss = relay_loss + 0.5 * dice_loss_from_probs(
                 endpoint_relay_probs,
                 endpoint_relay_target,
             )
         if "junction_relay_logits" in predictions:
-            junction_relay_target = F.max_pool2d(batch["junction"], kernel_size=5, stride=1, padding=2)
+            junction_relay_target = F.max_pool2d(junction_target, kernel_size=5, stride=1, padding=2)
             junction_relay_probs = torch.sigmoid(predictions["junction_relay_logits"])
             relay_loss = relay_loss + 0.5 * dice_loss_from_probs(
                 junction_relay_probs,
                 junction_relay_target,
             )
         if "node_capacity_logits" in predictions and "graph_node_capacity" in batch:
-            node_mask = torch.maximum(batch["junction"], batch["endpoint"])
+            node_mask = node_focus_target
             node_policy_loss = node_policy_loss + masked_smooth_l1(
                 torch.sigmoid(predictions["node_capacity_logits"]),
                 batch["graph_node_capacity"],
                 node_mask,
+            )
+        if "node_degree_logits" in predictions and "node_degree" in batch:
+            node_degree_probs = torch.sigmoid(predictions["node_degree_logits"])
+            node_degree_mask = F.max_pool2d(node_focus_target, kernel_size=7, stride=1, padding=3)
+            node_degree_loss = node_degree_loss + masked_smooth_l1(
+                node_degree_probs,
+                batch["node_degree"],
+                node_degree_mask,
+            )
+            degree_alignment_target = torch.clamp(pred_degree / 4.0, 0.0, 1.0)
+            node_degree_loss = node_degree_loss + 0.35 * masked_smooth_l1(
+                node_degree_probs,
+                degree_alignment_target,
+                node_degree_mask,
             )
         if "causal_saliency_logits" in predictions and "graph_causal_path" in batch:
             causal_saliency_probs = torch.sigmoid(predictions["causal_saliency_logits"])
@@ -568,7 +652,7 @@ class TopoSparseObjective(nn.Module):
                 backbone_target = batch["graph_backbone_path"].float()
                 redundant_target = batch["graph_redundant_path"].float()
                 node_buffer = F.max_pool2d(
-                    torch.maximum(batch["junction"], batch["endpoint"]),
+                    node_focus_target,
                     kernel_size=7,
                     stride=1,
                     padding=3,
@@ -586,6 +670,9 @@ class TopoSparseObjective(nn.Module):
                 )
                 branch_austerity_loss = branch_austerity_loss + 0.30 * (
                     dense_sparse_projection_probs * strict_redundant
+                ).mean()
+                branch_austerity_loss = branch_austerity_loss + 0.18 * (
+                    dense_sparse_projection_probs * degree_excess * (1.0 - node_buffer)
                 ).mean()
                 consistency_loss = consistency_loss + 0.10 * (
                     dense_sparse_projection_probs.detach() * strict_redundant
@@ -702,6 +789,7 @@ class TopoSparseObjective(nn.Module):
             + self.weights.get("topology", 0.5) * topology_loss
             + self.weights.get("node", 0.5) * node_loss
             + self.weights.get("node_tolerance", 0.0) * node_tolerance_loss
+            + self.weights.get("node_degree", 0.0) * node_degree_loss
             + self.weights.get("affinity", 0.5) * affinity_loss
             + self.weights.get("uncertainty", 0.1) * uncertainty_loss
             + self.weights.get("auxiliary", 0.0) * auxiliary_loss
@@ -725,6 +813,7 @@ class TopoSparseObjective(nn.Module):
             "topology_loss": topology_loss,
             "node_loss": node_loss,
             "node_tolerance_loss": node_tolerance_loss,
+            "node_degree_loss": node_degree_loss,
             "affinity_loss": affinity_loss,
             "uncertainty_loss": uncertainty_loss,
             "auxiliary_loss": auxiliary_loss,

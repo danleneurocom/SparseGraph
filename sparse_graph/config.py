@@ -46,6 +46,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "topology": 0.5,
         "node": 0.5,
         "node_tolerance": 0.0,
+        "node_degree": 0.0,
         "affinity": 0.5,
         "uncertainty": 0.1,
         "auxiliary": 0.0,

@@ -21,6 +21,7 @@ class GraphNode:
     x: int
     kind: str
     score: float
+    degree_hint: float = 0.0
 
 
 @dataclass
@@ -155,8 +156,21 @@ class GraphBuilder:
             if "dense_sparse_projection_logits" in predictions
             else None
         )
+        node_degree = (
+            torch.sigmoid(predictions["node_degree_logits"][0, 0])
+            if "node_degree_logits" in predictions
+            else None
+        )
 
-        nodes = self._extract_nodes(junction, endpoint, skeleton, relay, bridge, dense_sparse_projection)
+        nodes = self._extract_nodes(
+            junction,
+            endpoint,
+            skeleton,
+            relay,
+            bridge,
+            dense_sparse_projection,
+            node_degree,
+        )
         edges, candidate_bridges = self._propose_edges(
             nodes,
             mask,
@@ -164,6 +178,7 @@ class GraphBuilder:
             relay,
             bridge,
             dense_sparse_projection,
+            node_degree,
             uncertainty,
             affinity,
             graph_query,
@@ -208,6 +223,7 @@ class GraphBuilder:
         relay: torch.Tensor,
         bridge: torch.Tensor,
         dense_sparse_projection: torch.Tensor | None,
+        node_degree: torch.Tensor | None,
     ) -> list[GraphNode]:
         support = torch.maximum(skeleton, torch.maximum(relay, bridge))
         if dense_sparse_projection is not None:
@@ -217,12 +233,26 @@ class GraphBuilder:
             ("junction", junction, self.junction_threshold),
             ("endpoint", endpoint, self.endpoint_threshold),
         ):
-            pooled = F.max_pool2d(heatmap[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+            pooled = F.max_pool2d(heatmap[None, None], kernel_size=5, stride=1, padding=2)[0, 0]
             maxima = (heatmap >= threshold) & (heatmap == pooled)
             ys, xs = torch.nonzero(maxima, as_tuple=True)
             for y, x in zip(ys.tolist(), xs.tolist()):
-                score = 0.7 * float(heatmap[y, x].item()) + 0.3 * float(support[y, x].item())
-                candidates.append((kind, score, int(y), int(x)))
+                refined_y, refined_x = self._refine_peak(heatmap, support, int(y), int(x))
+                heat_score = float(heatmap[refined_y, refined_x].item())
+                support_score = float(support[refined_y, refined_x].item())
+                degree_value = (
+                    float(node_degree[refined_y, refined_x].item())
+                    if node_degree is not None
+                    else None
+                )
+                degree_consistency = self._degree_consistency(kind, degree_value)
+                if degree_value is not None:
+                    if kind == "junction" and degree_value < 0.16 and heat_score < float(threshold) + 0.12:
+                        continue
+                    if kind == "endpoint" and degree_value > 0.82 and heat_score < float(threshold) + 0.10:
+                        continue
+                score = 0.55 * heat_score + 0.25 * support_score + 0.20 * degree_consistency
+                candidates.append((kind, score, int(refined_y), int(refined_x)))
 
         # Greedy NMS stops repeated heatmap peaks from exploding the decoded graph.
         candidates.sort(key=lambda item: (item[1], 1 if item[0] == "junction" else 0), reverse=True)
@@ -237,9 +267,44 @@ class GraphBuilder:
                     x=x,
                     kind=kind,
                     score=score,
+                    degree_hint=(
+                        float(node_degree[y, x].item()) if node_degree is not None else 0.0
+                    ),
                 )
             )
         return nodes
+
+    def _refine_peak(
+        self,
+        heatmap: torch.Tensor,
+        support: torch.Tensor,
+        y: int,
+        x: int,
+        radius: int = 2,
+    ) -> tuple[int, int]:
+        height, width = heatmap.shape
+        y0 = max(y - radius, 0)
+        y1 = min(y + radius + 1, height)
+        x0 = max(x - radius, 0)
+        x1 = min(x + radius + 1, width)
+        heat_patch = heatmap[y0:y1, x0:x1]
+        support_patch = support[y0:y1, x0:x1]
+        weights = heat_patch * (0.65 + 0.35 * support_patch)
+        total = float(weights.sum().item())
+        if total <= 0.0:
+            return y, x
+        ys = torch.arange(y0, y1, device=heatmap.device, dtype=weights.dtype)[:, None]
+        xs = torch.arange(x0, x1, device=heatmap.device, dtype=weights.dtype)[None, :]
+        refined_y = int(torch.round((weights * ys).sum() / weights.sum()).item())
+        refined_x = int(torch.round((weights * xs).sum() / weights.sum()).item())
+        return max(0, min(refined_y, height - 1)), max(0, min(refined_x, width - 1))
+
+    def _degree_consistency(self, kind: str, degree_value: float | None) -> float:
+        if degree_value is None:
+            return 0.5
+        if kind == "junction":
+            return float(np.clip((degree_value - 0.18) / 0.82, 0.0, 1.0))
+        return float(np.clip(1.0 - degree_value / 0.48, 0.0, 1.0))
 
     def _propose_edges(
         self,
@@ -249,6 +314,7 @@ class GraphBuilder:
         relay: torch.Tensor,
         bridge: torch.Tensor,
         dense_sparse_projection: torch.Tensor | None,
+        node_degree: torch.Tensor | None,
         uncertainty: torch.Tensor,
         affinity: torch.Tensor,
         graph_query: torch.Tensor | None,
@@ -264,13 +330,22 @@ class GraphBuilder:
         used_pairs: set[tuple[int, int]] = set()
         degree_budget = {}
         for node in nodes:
+            degree_hint = float(node.degree_hint) if node_degree is not None else None
             if node.kind == "endpoint":
-                degree_budget[node.index] = 1
+                degree_budget[node.index] = 2 if degree_hint is not None and degree_hint > 0.88 and node.score > 0.78 else 1
                 continue
-            if node_capacity is not None:
-                capacity_value = float(node_capacity[node.y, node.x].item())
-                predicted_budget = int(round(1.0 + 3.0 * capacity_value))
-                degree_budget[node.index] = max(2, min(max(self.max_neighbors_per_node, 4), predicted_budget))
+            if node_capacity is not None or degree_hint is not None:
+                capacity_value = 0.0
+                if node_capacity is not None:
+                    capacity_value += 0.65 * float(node_capacity[node.y, node.x].item())
+                if degree_hint is not None:
+                    capacity_value += (0.35 if node_capacity is not None else 1.0) * self._degree_consistency(
+                        node.kind,
+                        float(degree_hint),
+                    )
+                capacity_value = float(np.clip(capacity_value, 0.0, 1.0))
+                predicted_budget = 2 + int(capacity_value > 0.72 and node.score > 0.65)
+                degree_budget[node.index] = max(2, min(max(self.max_neighbors_per_node, 3), predicted_budget))
             else:
                 degree_budget[node.index] = max(self.max_neighbors_per_node, 3)
         current_degree = {node.index: 0 for node in nodes}
@@ -301,6 +376,7 @@ class GraphBuilder:
             counterfactual_gate.detach().cpu().numpy() if counterfactual_gate is not None else None
         )
         node_capacity_np = node_capacity.detach().cpu().numpy() if node_capacity is not None else None
+        node_degree_np = node_degree.detach().cpu().numpy() if node_degree is not None else None
         causal_saliency_np = causal_saliency.detach().cpu().numpy() if causal_saliency is not None else None
         candidate_distance_limit = float(self.max_neighbor_distance) * float(self.candidate_distance_ratio)
         candidate_support_threshold = float(self.min_path_support) * float(self.candidate_support_ratio)
@@ -354,16 +430,31 @@ class GraphBuilder:
                     path_memory_np,
                     counterfactual_np,
                     node_capacity_np,
+                    node_degree_np,
                     causal_saliency_np,
                     support_np,
                     uncertainty_np,
                 )
                 edge_score = (1.0 - self.relation_weight) * heuristic_score + self.relation_weight * relation_prob
+                pair_degree_compat = 0.5 * (
+                    self._degree_consistency(node.kind, node.degree_hint)
+                    + self._degree_consistency(other.kind, other.degree_hint)
+                )
+                budget_pressure = max(
+                    current_degree[node.index] / max(degree_budget[node.index], 1),
+                    current_degree[other.index] / max(degree_budget[other.index], 1),
+                )
+                required_support = float(self.min_path_support) + 0.04 * max(0.0, budget_pressure - 0.5)
+                required_score = (
+                    float(self.min_path_support)
+                    + 0.05 * max(0.0, budget_pressure - 0.35)
+                    + 0.05 * max(0.0, 0.65 - pair_degree_compat)
+                )
                 meets_confirmed = (
                     not over_budget
                     and distance <= float(self.max_neighbor_distance)
-                    and path_support >= float(self.min_path_support)
-                    and edge_score >= float(self.min_path_support)
+                    and path_support >= required_support
+                    and edge_score >= required_score
                 )
                 if not meets_confirmed:
                     if (
@@ -482,6 +573,7 @@ class GraphBuilder:
         path_memory: np.ndarray | None,
         counterfactual_gate: np.ndarray | None,
         node_capacity: np.ndarray | None,
+        node_degree: np.ndarray | None,
         causal_saliency: np.ndarray | None,
         support_map: np.ndarray,
         uncertainty_map: np.ndarray,
@@ -506,6 +598,15 @@ class GraphBuilder:
             if node_capacity is not None
             else 0.0
         )
+        node_degree_score = (
+            0.5
+            * (
+                self._degree_consistency(node.kind, float(node_degree[node.y, node.x]))
+                + self._degree_consistency(other.kind, float(node_degree[other.y, other.x]))
+            )
+            if node_degree is not None
+            else 0.0
+        )
         causal_score = self._path_support(path, causal_saliency) if causal_saliency is not None else 0.0
         counterfactual_score = (
             self._path_support(path, counterfactual_gate) if counterfactual_gate is not None else 0.0
@@ -518,6 +619,7 @@ class GraphBuilder:
             + 0.90 * path_support
             + 0.75 * causal_score
             + 0.30 * node_capacity_score
+            + 0.15 * node_degree_score
             + 0.20 * counterfactual_score
             + 0.10 * 0.5 * (node.score + other.score)
             - 0.45 * uncertainty
@@ -679,6 +781,7 @@ class GraphBuilder:
         leaf_nodes = [node_lookup[index] for index in leaf_indices if index in node_lookup]
         leaf_score = max((node.score for node in leaf_nodes), default=0.0)
         leaf_kinds = {node.kind for node in leaf_nodes}
+        leaf_degree_hint = max((node.degree_hint for node in leaf_nodes), default=0.0)
 
         if edge_length <= int(self.prune_min_spur_length) and edge.score < float(self.prune_terminal_score):
             return True
@@ -687,6 +790,8 @@ class GraphBuilder:
             and edge.score < float(self.prune_terminal_score)
             and leaf_score < float(self.prune_terminal_node_score)
         ):
+            return True
+        if "endpoint" in leaf_kinds and leaf_degree_hint < 0.32 and edge_length <= int(self.prune_keep_trunk_length * 0.65):
             return True
         if self.prune_mode == "reviewer":
             if edge_length <= int(self.prune_min_spur_length * 1.5) and edge.score < float(self.prune_terminal_score + 0.05):

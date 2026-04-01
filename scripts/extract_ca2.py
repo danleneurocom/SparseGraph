@@ -240,6 +240,7 @@ def graph_to_json(graph_result: dict[str, Any]) -> dict[str, Any]:
                 "x": int(node.x),
                 "kind": node.kind,
                 "score": float(node.score),
+                "degree_hint": float(getattr(node, "degree_hint", 0.0)),
             }
             for node in graph_result["nodes"]
         ],

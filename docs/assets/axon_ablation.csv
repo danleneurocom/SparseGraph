@@ -1,0 +1,8 @@
+id,variant,delta,publish_score,skeleton_f1,junction_f1,endpoint_f1,branch_count_error,length_error
+A0,Shared U-Net,Baseline segmentation-only shared decoder,0.4259,0.3231,0.1482,0.002,6506.4,4.569
+A1,+ Relay / Geodesic,Add relay reasoning and geodesic relation decoding,0.523,0.4743,0.2286,0.2902,1160.2941,0.602
+A2,+ Unified Policy,Add unified causal policy with keep/prune routing,0.5657,0.5197,0.2521,0.347,2080.3059,0.4588
+A3,+ Dense-to-Sparse Projection,Inject dense-to-sparse projection prior into final skeleton prediction,0.5685,0.5219,0.2476,0.3585,1334.8353,0.3036
+A4,+ Prune-Aware Supervision,Train branch keep/prune heads against redundant graph paths,0.5702,0.5276,0.2459,0.3706,1523.6118,0.3307
+A5,+ Node Heatmaps / Degree,Use Gaussian node supervision and node-degree prediction,0.5992,0.5325,0.3826,0.3905,2127.2706,0.4347
+A6,+ Refined Degree-Aware Austerity,Tighten degree-aware pruning around endpoints and low-capacity nodes,0.5989,0.5337,0.3768,0.3883,1851.2471,0.3728

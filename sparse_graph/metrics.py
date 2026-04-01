@@ -34,13 +34,52 @@ def _neighbor_degree(binary: np.ndarray) -> np.ndarray:
     return degree * binary.astype(np.float32)
 
 
-def _peak_points(logits: torch.Tensor, threshold: float = 0.5) -> list[tuple[int, int]]:
+def _peak_points(
+    logits: torch.Tensor,
+    threshold: float = 0.5,
+    degree_map: torch.Tensor | None = None,
+    support_map: torch.Tensor | None = None,
+    kind: str | None = None,
+    nms_radius: float = 2.0,
+) -> list[tuple[int, int]]:
     if logits.ndim != 2:
         raise ValueError(f"Expected a 2D heatmap, got shape {tuple(logits.shape)}")
-    pooled = F.max_pool2d(logits[None, None], kernel_size=3, stride=1, padding=1)[0, 0]
+    pooled = F.max_pool2d(logits[None, None], kernel_size=5, stride=1, padding=2)[0, 0]
     maxima = (logits >= threshold) & (logits == pooled)
     ys, xs = torch.nonzero(maxima, as_tuple=True)
-    return list(zip(ys.tolist(), xs.tolist()))
+    candidates: list[tuple[float, int, int]] = []
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        y0 = max(int(y) - 2, 0)
+        y1 = min(int(y) + 3, int(logits.shape[0]))
+        x0 = max(int(x) - 2, 0)
+        x1 = min(int(x) + 3, int(logits.shape[1]))
+        patch = logits[y0:y1, x0:x1]
+        weights = patch
+        if support_map is not None:
+            weights = weights * (0.65 + 0.35 * support_map[y0:y1, x0:x1])
+        total = float(weights.sum().item())
+        if total > 0.0:
+            yy = torch.arange(y0, y1, device=logits.device, dtype=weights.dtype)[:, None]
+            xx = torch.arange(x0, x1, device=logits.device, dtype=weights.dtype)[None, :]
+            y = int(torch.round((weights * yy).sum() / weights.sum()).item())
+            x = int(torch.round((weights * xx).sum() / weights.sum()).item())
+        score = float(logits[y, x].item())
+        if degree_map is not None and kind is not None:
+            degree_value = float(degree_map[y, x].item())
+            if kind == "junction":
+                degree_score = float(np.clip((degree_value - 0.18) / 0.82, 0.0, 1.0))
+            else:
+                degree_score = float(np.clip(1.0 - degree_value / 0.58, 0.0, 1.0))
+            score = 0.75 * score + 0.25 * degree_score
+        candidates.append((score, int(y), int(x)))
+
+    candidates.sort(reverse=True)
+    kept: list[tuple[int, int]] = []
+    for _, y, x in candidates:
+        if any(np.hypot(py - y, px - x) <= float(nms_radius) for py, px in kept):
+            continue
+        kept.append((y, x))
+    return kept
 
 
 def _brier_score_from_probs(pred_probs: torch.Tensor, target_probs: torch.Tensor) -> float:
@@ -175,6 +214,9 @@ def graph_proxy_metrics(
     skeleton_prob = torch.sigmoid(predictions["skeleton_logits"])
     junction_prob = torch.sigmoid(predictions["junction_logits"])
     endpoint_prob = torch.sigmoid(predictions["endpoint_logits"])
+    node_degree_prob = (
+        torch.sigmoid(predictions["node_degree_logits"]) if "node_degree_logits" in predictions else None
+    )
 
     junction_f1_values: list[float] = []
     endpoint_f1_values: list[float] = []
@@ -208,8 +250,20 @@ def graph_proxy_metrics(
         target_length = float(target_skeleton.sum())
         length_errors.append(abs(pred_length - target_length) / max(target_length, 1.0))
 
-        pred_junction_points = _peak_points(junction_prob[index, 0], threshold=junction_threshold)
-        target_junction_points = _peak_points(batch["junction"][index, 0], threshold=junction_threshold)
+        pred_junction_points = _peak_points(
+            junction_prob[index, 0],
+            threshold=junction_threshold,
+            degree_map=node_degree_prob[index, 0] if node_degree_prob is not None else None,
+            support_map=skeleton_prob[index, 0],
+            kind="junction",
+        )
+        target_junction_points = _peak_points(
+            batch["junction"][index, 0],
+            threshold=junction_threshold,
+            degree_map=batch["node_degree"][index, 0] if "node_degree" in batch else None,
+            support_map=batch["skeleton"][index, 0],
+            kind="junction",
+        )
         junction_tp, junction_fp, junction_fn = _match_points(
             pred_junction_points,
             target_junction_points,
@@ -221,8 +275,20 @@ def graph_proxy_metrics(
             _safe_divide(2.0 * junction_precision * junction_recall, junction_precision + junction_recall)
         )
 
-        pred_endpoint_points = _peak_points(endpoint_prob[index, 0], threshold=endpoint_threshold)
-        target_endpoint_points = _peak_points(batch["endpoint"][index, 0], threshold=endpoint_threshold)
+        pred_endpoint_points = _peak_points(
+            endpoint_prob[index, 0],
+            threshold=endpoint_threshold,
+            degree_map=node_degree_prob[index, 0] if node_degree_prob is not None else None,
+            support_map=skeleton_prob[index, 0],
+            kind="endpoint",
+        )
+        target_endpoint_points = _peak_points(
+            batch["endpoint"][index, 0],
+            threshold=endpoint_threshold,
+            degree_map=batch["node_degree"][index, 0] if "node_degree" in batch else None,
+            support_map=batch["skeleton"][index, 0],
+            kind="endpoint",
+        )
         endpoint_tp, endpoint_fp, endpoint_fn = _match_points(
             pred_endpoint_points,
             target_endpoint_points,

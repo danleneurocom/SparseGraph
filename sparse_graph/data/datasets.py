@@ -17,6 +17,51 @@ def _ensure_channel_first(array: np.ndarray) -> np.ndarray:
     return array
 
 
+def _neighbor_degree(binary: np.ndarray) -> np.ndarray:
+    padded = np.pad(binary.astype(np.float32), 1)
+    degree = np.zeros_like(binary, dtype=np.float32)
+    height, width = binary.shape
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dy == 0 and dx == 0:
+                continue
+            degree += padded[1 + dy : 1 + dy + height, 1 + dx : 1 + dx + width]
+    return degree * binary.astype(np.float32)
+
+
+def _gaussian_node_heatmap(binary: np.ndarray, sigma: float = 1.5) -> np.ndarray:
+    binary = binary.astype(np.float32)
+    if float(binary.max()) <= 0.0:
+        return np.zeros_like(binary, dtype=np.float32)
+    heatmap = ndimage.gaussian_filter(binary, sigma=float(sigma), mode="constant")
+    peak = float(heatmap.max())
+    if peak > 0.0:
+        heatmap = heatmap / peak
+    return heatmap.astype(np.float32)
+
+
+def _node_degree_target(
+    skeleton: np.ndarray,
+    junction: np.ndarray,
+    endpoint: np.ndarray,
+    sigma: float = 1.5,
+) -> np.ndarray:
+    skeleton_binary = (skeleton > 0.5).astype(np.float32)
+    node_binary = np.maximum((junction > 0.5).astype(np.float32), (endpoint > 0.5).astype(np.float32))
+    if float(node_binary.max()) <= 0.0:
+        return np.zeros_like(skeleton_binary, dtype=np.float32)
+
+    degree = _neighbor_degree(skeleton_binary)
+    normalized_degree = np.clip((degree - 1.0) / 3.0, 0.0, 1.0)
+    degree_seed = normalized_degree * node_binary
+    support = ndimage.gaussian_filter(node_binary, sigma=float(sigma), mode="constant")
+    degree_blur = ndimage.gaussian_filter(degree_seed, sigma=float(sigma), mode="constant")
+    degree_map = degree_blur / np.maximum(support, 1e-6)
+    if float(support.max()) > 0.0:
+        degree_map = degree_map * np.clip(support / float(support.max()), 0.0, 1.0)
+    return np.clip(degree_map, 0.0, 1.0).astype(np.float32)
+
+
 def _line_points(start: tuple[int, int], end: tuple[int, int]) -> list[tuple[int, int]]:
     y0, x0 = start
     y1, x1 = end
@@ -502,6 +547,13 @@ class CalciumSummaryNpzDataset(Dataset):
             else:
                 uncertainty = np.zeros((1, image.shape[-2], image.shape[-1]), dtype=np.float32)
 
+        junction_heatmap = _gaussian_node_heatmap(junction[0])
+        endpoint_heatmap = _gaussian_node_heatmap(endpoint[0])
+        node_degree = _node_degree_target(
+            skeleton=skeleton[0],
+            junction=junction[0],
+            endpoint=endpoint[0],
+        )
         graph_targets = _build_graph_training_targets(
             skeleton=skeleton[0],
             junction=junction[0],
@@ -514,6 +566,9 @@ class CalciumSummaryNpzDataset(Dataset):
             "skeleton": torch.from_numpy(skeleton),
             "junction": torch.from_numpy(junction),
             "endpoint": torch.from_numpy(endpoint),
+            "junction_heatmap": torch.from_numpy(junction_heatmap[None, ...].astype(np.float32)),
+            "endpoint_heatmap": torch.from_numpy(endpoint_heatmap[None, ...].astype(np.float32)),
+            "node_degree": torch.from_numpy(node_degree[None, ...].astype(np.float32)),
             "affinity": torch.from_numpy(affinity),
             "uncertainty": torch.from_numpy(uncertainty),
         }
@@ -546,6 +601,13 @@ class SyntheticCalciumDataset(Dataset):
         endpoint = ((skeleton > 0) & (degree == 1)).astype(np.float32)
         uncertainty = ((degree >= 4).astype(np.float32))[None, ...]
         affinity = self._estimate_affinity(skeleton)
+        junction_heatmap = _gaussian_node_heatmap(junction)
+        endpoint_heatmap = _gaussian_node_heatmap(endpoint)
+        node_degree = _node_degree_target(
+            skeleton=skeleton,
+            junction=junction,
+            endpoint=endpoint,
+        )
 
         skeleton_tensor = torch.from_numpy(skeleton[None, ...].astype(np.float32))
         kernel_size = int(rng.integers(5, 10))
@@ -576,6 +638,9 @@ class SyntheticCalciumDataset(Dataset):
             "skeleton": skeleton_tensor,
             "junction": torch.from_numpy(junction[None, ...].astype(np.float32)),
             "endpoint": torch.from_numpy(endpoint[None, ...].astype(np.float32)),
+            "junction_heatmap": torch.from_numpy(junction_heatmap[None, ...].astype(np.float32)),
+            "endpoint_heatmap": torch.from_numpy(endpoint_heatmap[None, ...].astype(np.float32)),
+            "node_degree": torch.from_numpy(node_degree[None, ...].astype(np.float32)),
             "affinity": torch.from_numpy(affinity.astype(np.float32)),
             "uncertainty": torch.from_numpy(uncertainty.astype(np.float32)),
         }
@@ -629,14 +694,7 @@ class SyntheticCalciumDataset(Dataset):
         return image
 
     def _neighbor_degree(self, skeleton: np.ndarray) -> np.ndarray:
-        padded = np.pad(skeleton, 1)
-        degree = np.zeros_like(skeleton, dtype=np.float32)
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                degree += padded[1 + dy : 1 + dy + self.image_size, 1 + dx : 1 + dx + self.image_size]
-        return degree * skeleton
+        return _neighbor_degree(skeleton)
 
     def _estimate_affinity(self, skeleton: np.ndarray) -> np.ndarray:
         affinity = np.zeros((2, self.image_size, self.image_size), dtype=np.float32)

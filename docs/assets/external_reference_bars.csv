@@ -1,0 +1,4 @@
+reference,dataset,reported_metrics,protocol_note
+Axon dataset tracing paper,Public single-neuron axon dataset,"Precision 0.82, Recall 0.97, F1 0.87",3D tracing/tree protocol; not directly comparable to our 2D proxy evaluation
+FISBe / PatchPerPix,FISBe benchmark,"avF1 0.29-0.34, clDice_TP 0.80-0.81",Official FISBe instance protocol; different target and metric suite
+Topology-aware cascaded U-Net,IXI vessels,"DSC 0.83, clDice 0.88","Medical vessel segmentation; relevant topology reference, different domain"
